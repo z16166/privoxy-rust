@@ -303,7 +303,7 @@ impl Default for Config {
             trust_files: Vec::new(),
             actions_files: Vec::new(),
             filter_files: Vec::new(),
-            permit_access: vec!["0.0.0.0/0".to_string()],
+            permit_access: Vec::new(), // Deny all by default, matching C implementation
             deny_access: Vec::new(),
             admin_address: None,
             proxy_info_url: Some(HOME_PAGE_URL.to_string()),
@@ -462,7 +462,7 @@ impl Config {
 
                 match key {
                     "listen-address" => {
-                        config.listen_addresses = parse_listen_addresses(value)?;
+                        config.listen_addresses.extend(parse_listen_addresses(value)?);
                     }
                     "logfile" => {
                         config.log_file = Some(PathBuf::from(value));
@@ -477,8 +477,9 @@ impl Config {
                         config.enable_edit_actions = parse_bool(value)?;
                     }
                     "buffer-limit" => {
-                        config.buffer_limit = value.parse()
+                        let val: usize = value.parse()
                             .map_err(|_| PrivoxyError::Config(format!("Invalid buffer limit: {}", value)))?;
+                        config.buffer_limit = val * 1024; // C version uses KB
                     }
                     "max-client-connections" => {
                         config.max_client_connections = value.parse()
@@ -537,8 +538,8 @@ impl Config {
                             config.forward_specs.push(spec);
                         }
                     }
-                    "debug" => {
-                        config.log_level = parse_debug_level(value)?;
+                    "debug" | "log-level" => {
+                        config.log_level |= parse_debug_level(value)?;
                     }
                     "enable-compression" => {
                         config.feature_flags.enable_compression = parse_bool(value)?;
@@ -596,9 +597,6 @@ impl Config {
                     "log-file" => {
                         config.log_file = Some(PathBuf::from(value));
                     }
-                    "log-level" => {
-                        config.log_level = parse_debug_level(value)?;
-                    }
                     "connection-timeout" => {
                         config.connection_timeout_secs = value.parse()
                             .map_err(|_| PrivoxyError::Config(format!("Invalid connection timeout: {}", value)))?;
@@ -626,9 +624,6 @@ impl Config {
                     "split-large-forms" => {
                         // Split large forms in CGI interface
                         debug!("Split-large-forms directive: {}", value);
-                    }
-                    "debug" => {
-                        config.log_level = parse_debug_level(value)?;
                     }
                     _ => {
                         warn!("Unknown configuration directive: {} {}", key, value);
@@ -676,6 +671,11 @@ impl Config {
             }
         }
 
+        // If permit list is empty, allow all (unless specifically denied above)
+        if self.permit_access.is_empty() {
+            return true;
+        }
+
         // Then check permit list
         for pattern in &self.permit_access {
             if matches_pattern(addr, pattern) {
@@ -683,8 +683,8 @@ impl Config {
             }
         }
 
-        // Default deny if no permit matches
-        !self.permit_access.is_empty()
+        // Default deny if permit list is not empty and no match was found
+        false
     }
     
     pub fn any_loaded_file_changed(&self) -> bool {
@@ -769,43 +769,45 @@ fn parse_bool(value: &str) -> PrivoxyResult<bool> {
 }
 
 fn parse_forward_spec(value: &str, forward_type: ForwardType) -> PrivoxyResult<Option<ForwardSpec>> {
-    // Format: [proxy_host:proxy_port] [pattern]
-    // Examples:
-    //   forward-socks5 127.0.0.1:9090 .
-    //   forward / .
-    //   forward-socks5 127.0.0.1:9050 .onion
+    // Format:
+    //   forward  url-pattern  http-proxy-host[:port]
+    //   forward-socks5  url-pattern  socks-proxy[:port]  http-proxy-host[:port]
+    
     let parts: Vec<&str> = value.split_whitespace().collect();
     if parts.is_empty() {
         return Ok(None);
     }
 
-    let (proxy_host, proxy_port, pattern) = if parts[0] == "/" {
-        // Direct connection: forward / .
-        ("0.0.0.0".to_string(), 0, parts.get(1).unwrap_or(&".").to_string())
-    } else if parts.len() >= 2 {
-        // Proxy connection: forward-socks5 127.0.0.1:9090 .
-        let proxy = parts[0];
-        let (host, port) = if let Some((h, p)) = proxy.rsplit_once(':') {
-            let port_num = p.parse()
-                .map_err(|_| PrivoxyError::Config(format!("Invalid port: {}", p)))?;
-            (h.to_string(), port_num)
+    let pattern = parts[0].to_string();
+    
+    let (proxy_host, proxy_port) = if parts.len() >= 2 {
+        let proxy = parts[1];
+        if proxy == "." {
+            ("0.0.0.0".to_string(), 0)
         } else {
-            (proxy.to_string(), 1080) // Default SOCKS port
-        };
-        let pattern = parts[1].to_string();
-        (host, port, pattern)
+            if let Some((host, port_str)) = proxy.rsplit_once(':') {
+                let port = port_str.parse()
+                    .map_err(|_| PrivoxyError::Config(format!("Invalid proxy port: {}", port_str)))?;
+                (host.to_string(), port)
+            } else {
+                // Default ports based on type
+                let port = match forward_type {
+                    ForwardType::Socks4 | ForwardType::Socks4a | ForwardType::Socks5 | ForwardType::Socks5t => 1080,
+                    _ => 8000,
+                };
+                (proxy.to_string(), port)
+            }
+        }
     } else {
-        // Only proxy specified, match all
-        let proxy = parts[0];
-        let (host, port) = if let Some((h, p)) = proxy.rsplit_once(':') {
-            let port_num = p.parse()
-                .map_err(|_| PrivoxyError::Config(format!("Invalid port: {}", p)))?;
-            (h.to_string(), port_num)
-        } else {
-            (proxy.to_string(), 1080)
-        };
-        (host, port, ".".to_string())
+        ("0.0.0.0".to_string(), 0)
     };
+
+    // XXX: Rust version currently only stores one proxy per ForwardSpec.
+    // In C, socks directives can have a parent HTTP proxy as 3rd arg.
+    // We ignore the 3rd arg for now or could extend ForwardSpec if needed.
+    if parts.len() > 2 && parts[2] != "." {
+        warn!("Ignoring parent HTTP proxy '{}' in forward directive", parts[2]);
+    }
 
     Ok(Some(ForwardSpec {
         pattern,
@@ -901,8 +903,65 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
+        // C implementation defaults to NO ACLs (all permitted)
+        assert!(config.permit_access.is_empty());
+        assert!(config.is_access_allowed("127.0.0.1"));
         assert_eq!(config.listen_addresses.len(), 1);
         assert_eq!(config.listen_addresses[0].port, 8118);
+    }
+
+    #[test]
+    fn test_is_access_allowed() {
+        let mut config = Config::default();
+        
+        // Default: empty permit/deny lists should allow all
+        assert!(config.is_access_allowed("127.0.0.1"));
+        assert!(config.is_access_allowed("192.168.1.1"));
+
+        // Only permit 127.0.0.1
+        config.permit_access.push("127.0.0.1".to_string());
+        assert!(config.is_access_allowed("127.0.0.1"));
+        assert!(!config.is_access_allowed("192.168.1.1"));
+
+        // Deny 127.0.0.1 even if permitted
+        config.deny_access.push("127.0.0.1".to_string());
+        assert!(!config.is_access_allowed("127.0.0.1"));
+    }
+
+    #[test]
+    fn test_config_audit_fixes() {
+        let config_text = r#"
+listen-address 127.0.0.1:8118
+listen-address 0.0.0.0:8119
+buffer-limit 4096
+debug 1
+debug 2
+forward .example.com 127.0.0.1:8080
+forward-socks5 .onion 127.0.0.1:9050 .
+"#;
+        let config = Config::parse(config_text).unwrap();
+        
+        // Match C behavior for buffer-limit (KB -> bytes)
+        assert_eq!(config.buffer_limit, 4096 * 1024);
+        
+        // Cumulative debug levels
+        assert_ne!(config.log_level & LOG_LEVEL_REQUEST, 0);
+        assert_ne!(config.log_level & LOG_LEVEL_CONNECT, 0);
+        
+        // Multiple listeners (1 default + 2 from config)
+        assert_eq!(config.listen_addresses.len(), 3);
+        assert_eq!(config.listen_addresses[1].port, 8118);
+        assert_eq!(config.listen_addresses[2].port, 8119);
+        
+        // Forward pattern order (pattern first, then proxy)
+        let fwd = config.get_forward_spec("test.example.com", 80).expect("Should have forward spec");
+        assert_eq!(fwd.proxy_host, "127.0.0.1");
+        assert_eq!(fwd.proxy_port, 8080);
+        
+        let socks_fwd = config.get_forward_spec("something.onion", 80).expect("Should have socks forward spec");
+        assert_eq!(socks_fwd.proxy_host, "127.0.0.1");
+        assert_eq!(socks_fwd.proxy_port, 9050);
+        assert_eq!(socks_fwd.forward_type, ForwardType::Socks5);
     }
 
     #[test]
