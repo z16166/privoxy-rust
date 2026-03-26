@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use tokio::signal;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 mod action;
 mod compression;

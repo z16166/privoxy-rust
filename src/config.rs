@@ -66,12 +66,14 @@ impl FileModification {
 
 pub type ConfigRef = Arc<RwLock<Config>>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ForwardSpec {
     pub pattern: String,
-    pub proxy_host: String,
-    pub proxy_port: u16,
     pub forward_type: ForwardType,
+    pub gateway_host: Option<String>,
+    pub gateway_port: u16,
+    pub forward_host: Option<String>,
+    pub forward_port: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -768,10 +770,23 @@ fn parse_bool(value: &str) -> PrivoxyResult<bool> {
     }
 }
 
+fn parse_proxy_spec(proxy: &str, default_port: u16) -> PrivoxyResult<(String, u16)> {
+    if proxy == "." {
+        return Ok(("0.0.0.0".to_string(), 0));
+    }
+    if let Some((host, port_str)) = proxy.rsplit_once(':') {
+        let port = port_str.parse()
+            .map_err(|_| PrivoxyError::Config(format!("Invalid proxy port: {}", port_str)))?;
+        Ok((host.to_string(), port))
+    } else {
+        Ok((proxy.to_string(), default_port))
+    }
+}
+
 fn parse_forward_spec(value: &str, forward_type: ForwardType) -> PrivoxyResult<Option<ForwardSpec>> {
-    // Format:
-    //   forward  url-pattern  http-proxy-host[:port]
-    //   forward-socks5  url-pattern  socks-proxy[:port]  http-proxy-host[:port]
+    // C format in config file:
+    // forward  url-pattern  http-proxy-host[:port]
+    // forward-socks5  url-pattern  socks-proxy[:port]  http-proxy-host[:port]
     
     let parts: Vec<&str> = value.split_whitespace().collect();
     if parts.is_empty() {
@@ -779,45 +794,52 @@ fn parse_forward_spec(value: &str, forward_type: ForwardType) -> PrivoxyResult<O
     }
 
     let pattern = parts[0].to_string();
-    
-    let (proxy_host, proxy_port) = if parts.len() >= 2 {
-        let proxy = parts[1];
-        if proxy == "." {
-            ("0.0.0.0".to_string(), 0)
-        } else {
-            if let Some((host, port_str)) = proxy.rsplit_once(':') {
-                let port = port_str.parse()
-                    .map_err(|_| PrivoxyError::Config(format!("Invalid proxy port: {}", port_str)))?;
-                (host.to_string(), port)
-            } else {
-                // Default ports based on type
-                let port = match forward_type {
-                    ForwardType::Socks4 | ForwardType::Socks4a | ForwardType::Socks5 | ForwardType::Socks5t => 1080,
-                    _ => 8000,
-                };
-                (proxy.to_string(), port)
-            }
-        }
-    } else {
-        ("0.0.0.0".to_string(), 0)
+    let mut spec = ForwardSpec {
+        pattern,
+        forward_type,
+        gateway_host: None,
+        gateway_port: 0,
+        forward_host: None,
+        forward_port: 0,
     };
 
-    // XXX: Rust version currently only stores one proxy per ForwardSpec.
-    // In C, socks directives can have a parent HTTP proxy as 3rd arg.
-    // We ignore the 3rd arg for now or could extend ForwardSpec if needed.
-    if parts.len() > 2 && parts[2] != "." {
-        warn!("Ignoring parent HTTP proxy '{}' in forward directive", parts[2]);
+    match spec.forward_type {
+        ForwardType::Direct | ForwardType::ForwardWebserver => {
+            // No proxies
+        }
+        ForwardType::Http => {
+            // forward pattern http-proxy
+            if parts.len() >= 2 {
+                let (host, port) = parse_proxy_spec(parts[1], 8000)?;
+                if host != "0.0.0.0" {
+                    spec.forward_host = Some(host);
+                    spec.forward_port = port;
+                }
+            }
+        }
+        ForwardType::Socks4 | ForwardType::Socks4a | ForwardType::Socks5 | ForwardType::Socks5t => {
+            // forward-socks5 pattern socks-proxy [http-proxy]
+            if parts.len() >= 2 {
+                let (host, port) = parse_proxy_spec(parts[1], 1080)?;
+                if host != "0.0.0.0" {
+                    spec.gateway_host = Some(host);
+                    spec.gateway_port = port;
+                }
+            }
+            if parts.len() >= 3 {
+                let (host, port) = parse_proxy_spec(parts[2], 8000)?;
+                if host != "0.0.0.0" {
+                    spec.forward_host = Some(host);
+                    spec.forward_port = port;
+                }
+            }
+        }
     }
 
-    Ok(Some(ForwardSpec {
-        pattern,
-        proxy_host,
-        proxy_port,
-        forward_type,
-    }))
+    Ok(Some(spec))
 }
 
-fn matches_host_pattern(host: &str, pattern: &str) -> bool {
+pub fn matches_host_pattern(host: &str, pattern: &str) -> bool {
     // Pattern "." matches all hosts
     if pattern == "." {
         return true;
@@ -955,13 +977,15 @@ forward-socks5 .onion 127.0.0.1:9050 .
         
         // Forward pattern order (pattern first, then proxy)
         let fwd = config.get_forward_spec("test.example.com", 80).expect("Should have forward spec");
-        assert_eq!(fwd.proxy_host, "127.0.0.1");
-        assert_eq!(fwd.proxy_port, 8080);
+        assert_eq!(fwd.forward_host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(fwd.forward_port, 8080);
+        assert!(fwd.gateway_host.is_none());
         
         let socks_fwd = config.get_forward_spec("something.onion", 80).expect("Should have socks forward spec");
-        assert_eq!(socks_fwd.proxy_host, "127.0.0.1");
-        assert_eq!(socks_fwd.proxy_port, 9050);
+        assert_eq!(socks_fwd.gateway_host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(socks_fwd.gateway_port, 9050);
         assert_eq!(socks_fwd.forward_type, ForwardType::Socks5);
+        assert!(socks_fwd.forward_host.is_none());
     }
 
     #[test]

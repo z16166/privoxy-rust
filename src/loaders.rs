@@ -477,56 +477,64 @@ pub fn parse_forward_directive(line: &str) -> PrivoxyResult<Option<ForwardSpec>>
         )));
     }
 
-    // For forward-override, the format is: forward-socks5 <proxy_host:port> <pattern>
-    // But for main config, the format is: forward-socks5 <pattern> <proxy_host:port>
-    // We need to detect which format is being used
+    // forward-override format is different: it doesn't have a pattern.
+    // forward host:port
+    // forward-socks5 socks_host:port http_parent_host:port
     
-    // Check if parts[1] contains a colon (indicating host:port)
-    let (proxy_host, proxy_port, pattern) = if parts[1].contains(':') {
-        // Format: forward-socks5 <proxy_host:port> <pattern>
-        let target = parts[1];
-        let (host, port) = parse_host_port(target)?;
-        let pat = if parts.len() > 2 { parts[2] } else { "." };
-        (host, port, pat)
-    } else {
-        // Format: forward-socks5 <pattern> <proxy_host:port>
-        let pat = parts[1];
-        
-        // Handle direct connection (single dot or /. pattern)
-        if pat == "." || pat == "/." {
-            return Ok(None);
-        }
-        
-        if parts.len() < 3 {
-            return Err(PrivoxyError::Config(format!(
-                "{} directive requires target host:port",
-                directive
-            )));
-        }
-        
-        let target = parts[2];
-        let (host, port) = parse_host_port(target)?;
-        (host, port, pat)
+    let mut spec = ForwardSpec {
+        pattern: String::new(),
+        forward_type,
+        gateway_host: None,
+        gateway_port: 0,
+        forward_host: None,
+        forward_port: 0,
     };
 
-    Ok(Some(ForwardSpec {
-        pattern: pattern.to_string(),
-        proxy_host,
-        proxy_port,
-        forward_type,
-    }))
+    match spec.forward_type {
+        ForwardType::Direct | ForwardType::ForwardWebserver => {
+            // No proxies
+        }
+        ForwardType::Http => {
+            if parts.len() >= 2 {
+                let (host, port) = parse_host_port(parts[1])?;
+                if host != "0.0.0.0" {
+                    spec.forward_host = Some(host);
+                    spec.forward_port = port;
+                }
+            }
+        }
+        ForwardType::Socks4 | ForwardType::Socks4a | ForwardType::Socks5 | ForwardType::Socks5t => {
+            if parts.len() >= 2 {
+                let (host, port) = parse_host_port(parts[1])?;
+                if host != "0.0.0.0" {
+                    spec.gateway_host = Some(host);
+                    spec.gateway_port = port;
+                }
+            }
+            if parts.len() >= 3 {
+                let (host, port) = parse_host_port(parts[2])?;
+                if host != "0.0.0.0" {
+                    spec.forward_host = Some(host);
+                    spec.forward_port = port;
+                }
+            }
+        }
+    }
+
+    Ok(Some(spec))
 }
 
 fn parse_host_port(host_port: &str) -> PrivoxyResult<(String, u16)> {
+    if host_port == "." {
+        return Ok(("0.0.0.0".to_string(), 0));
+    }
     if let Some((host, port_str)) = host_port.rsplit_once(':') {
         let port: u16 = port_str.parse()
             .map_err(|_| PrivoxyError::Config(format!("Invalid port number: {}", port_str)))?;
         Ok((host.to_string(), port))
     } else {
-        Err(PrivoxyError::Config(format!(
-            "Invalid host:port format: {}",
-            host_port
-        )))
+        // Default port can be 0 or a logical default; caller handles specific defaults
+        Ok((host_port.to_string(), 0))
     }
 }
 

@@ -1,38 +1,29 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
-
 use bytes::{Bytes, BytesMut};
-use parking_lot::RwLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_socks::tcp::socks5::Socks5Stream;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::action::{
     find_action_for_url, ActionContext,
-    apply_client_header_taggers,
-    apply_add_header, apply_crunch_client_header,
-    apply_crunch_server_header, apply_crunch_outgoing_cookies, apply_crunch_incoming_cookies,
-    apply_crunch_if_none_match, apply_change_x_forwarded_for, apply_hide_referrer,
-    apply_hide_user_agent, apply_send_user_agent, apply_hide_from_header,
-    apply_hide_accept_language, apply_hide_if_modified_since, apply_hide_content_disposition,
-    apply_prevent_compression, apply_downgrade_http_version, apply_session_cookies_only,
-    apply_content_type_overwrite, apply_overwrite_last_modified, apply_limit_cookie_lifetime,
-    apply_force_text_mode, check_limit_connect, apply_fast_redirects,
+    apply_client_header_actions, apply_server_header_actions,
+    apply_client_header_taggers, apply_server_header_taggers,
+    apply_client_body_taggers, apply_client_body_filter,
+    apply_content_filters, check_limit_connect,
     apply_suppress_tags, create_blocked_page_response, create_blocked_image_response,
     create_empty_document_response, create_redirect_response,
-    apply_server_header_taggers, apply_client_body_taggers, apply_client_body_filter,
-    apply_content_filters, apply_client_header_filters, apply_server_header_filters,
+    apply_fast_redirects, apply_downgrade_http_version,
+    apply_limit_cookie_lifetime, apply_force_text_mode,
 };
 
 #[cfg(feature = "image-blocking")]
 use crate::action::deanimate_gif;
 use crate::compression::decompress;
-use crate::config::{ConfigRef, ForwardType};
+use crate::config::ConfigRef;
 use crate::constants::*;
 use crate::error::{PrivoxyError, PrivoxyResult};
 use crate::filter::{FilterType, FilterVariables};
@@ -117,22 +108,32 @@ impl ConnectionHandler {
         }
     }
 
-    fn find_forward_spec(&self, host: &str, _port: u16) -> Option<(String, u16, ForwardType)> {
+    fn find_forward_spec(&self, host: &str, _port: u16) -> Option<crate::config::ForwardSpec> {
         let config = self.config.read();
         
         // First check actionsfile rules for forward-override
         for url_action in &config.url_actions {
             for pattern in &url_action.patterns {
-                if Self::matches_pattern(host, pattern) {
+                if crate::config::matches_host_pattern(host, pattern) {
                     if let Some(forward_override) = &url_action.action.forward_override {
                         // Parse the forward directive from forward_override
                         match crate::loaders::parse_forward_directive(forward_override) {
-                            Ok(Some(spec)) => {
-                                return Some((spec.proxy_host.clone(), spec.proxy_port, spec.forward_type.clone()));
+                            Ok(Some(mut spec)) => {
+                                // Pattern in override is not used, it's just a proxy spec
+                                spec.pattern = pattern.clone();
+                                return Some(spec);
                             }
                             Ok(None) => {
                                 // Handle forward . case - direct connection
-                                return Some((String::new(), 0, crate::config::ForwardType::Direct));
+                                let mut spec = crate::config::ForwardSpec {
+                                    pattern: pattern.clone(),
+                                    forward_type: crate::config::ForwardType::Direct,
+                                    gateway_host: None,
+                                    gateway_port: 0,
+                                    forward_host: None,
+                                    forward_port: 0,
+                                };
+                                return Some(spec);
                             }
                             Err(e) => {
                                 // Log error but continue checking other rules
@@ -146,8 +147,8 @@ impl ConnectionHandler {
         
         // Then check main config forward specs
         for spec in &config.forward_specs {
-            if Self::matches_pattern(host, &spec.pattern) {
-                return Some((spec.proxy_host.clone(), spec.proxy_port, spec.forward_type.clone()));
+            if crate::config::matches_host_pattern(host, &spec.pattern) {
+                return Some(spec.clone());
             }
         }
         None
@@ -180,89 +181,79 @@ impl ConnectionHandler {
         false
     }
 
-    async fn connect_to_target(&self, host: &str, port: u16) -> PrivoxyResult<TcpStream> {
-        let forward_spec = self.find_forward_spec(host, port);
+    async fn connect_to_target(&self, host: &str, port: u16) -> PrivoxyResult<(TcpStream, crate::config::ForwardSpec)> {
+        let forward_spec = self.find_forward_spec(host, port).unwrap_or_else(|| {
+            crate::config::ForwardSpec {
+                pattern: String::new(),
+                forward_type: crate::config::ForwardType::Direct,
+                gateway_host: None,
+                gateway_port: 0,
+                forward_host: None,
+                forward_port: 0,
+            }
+        });
         
-        match forward_spec {
-            Some((proxy_host, proxy_port, forward_type)) => {
-                debug!("Using {} proxy {}:{}", 
-                    match &forward_type {
-                        ForwardType::Socks5 => "SOCKS5",
-                        ForwardType::Socks5t => "SOCKS5T (Tor optimistic)",
-                        ForwardType::Socks4 => "SOCKS4",
-                        ForwardType::Socks4a => "SOCKS4a",
-                        ForwardType::Http => "HTTP",
-                        ForwardType::Direct => "Direct",
-                        ForwardType::ForwardWebserver => "ForwardWebserver",
-                    },
-                    proxy_host, proxy_port
-                );
-                
-                match forward_type {
-                    ForwardType::Socks5 | ForwardType::Socks5t => {
-                        let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
-                        let target_addr = format!("{}:{}", host, port);
-                        
-                        let stream = TcpStream::connect(&proxy_addr).await
-                            .map_err(|e| PrivoxyError::Connection(
-                                format!("Failed to connect to SOCKS5 proxy {}: {}", proxy_addr, e)
-                            ))?;
-                        
-                        // For SOCKS5T, we use the same connection as SOCKS5
-                        // The optimistic data handling is done at the HTTP request level
-                        let socks_stream = Socks5Stream::connect_with_socket(stream, target_addr.as_str())
-                            .await
-                            .map_err(|e| PrivoxyError::Connection(
-                                format!("SOCKS5 connect failed: {:?}", e)
-                            ))?;
-                        
-                        Ok(socks_stream.into_inner())
-                    }
-                    ForwardType::Socks4 | ForwardType::Socks4a => {
-                        let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
-                        let target_addr = format!("{}:{}", host, port);
-                        
-                        let stream = TcpStream::connect(&proxy_addr).await
-                            .map_err(|e| PrivoxyError::Connection(
-                                format!("Failed to connect to SOCKS4 proxy {}: {}", proxy_addr, e)
-                            ))?;
-                        
-                        let socks_stream = tokio_socks::tcp::socks4::Socks4Stream::connect_with_socket(
-                            stream, 
-                            target_addr.as_str()
-                        )
-                            .await
-                            .map_err(|e| PrivoxyError::Connection(
-                                format!("SOCKS4 connect failed: {:?}", e)
-                            ))?;
-                        
-                        Ok(socks_stream.into_inner())
-                    }
-                    ForwardType::Http | ForwardType::ForwardWebserver => {
-                        // For both HTTP proxy and ForwardWebserver, connect to the proxy/server
-                        let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
-                        TcpStream::connect(&proxy_addr).await
-                            .map_err(|e| PrivoxyError::Connection(
-                                format!("Failed to connect to {}: {}", proxy_addr, e)
-                            ))
-                    }
-                    ForwardType::Direct => {
-                        let target_addr = format!("{}:{}", host, port);
-                        TcpStream::connect(&target_addr).await
-                            .map_err(|e| PrivoxyError::Connection(
-                                format!("Failed to connect to {}: {}", target_addr, e)
-                            ))
-                    }
+        debug!("Forwarding decision for {}:{}: {:?}", host, port, forward_spec.forward_type);
+        
+        // Step 1: Connect to gateway (SOCKS) if specified
+        let mut stream = if let Some(ref gateway_host) = forward_spec.gateway_host {
+            let gateway_addr = format!("{}:{}", gateway_host, forward_spec.gateway_port);
+            
+            // Determine next hop address for SOCKS tunnel
+            let next_hop = if let Some(ref forward_host) = forward_spec.forward_host {
+                format!("{}:{}", forward_host, forward_spec.forward_port)
+            } else {
+                format!("{}:{}", host, port)
+            };
+
+            debug!("Connecting to SOCKS gateway {} to reach {}", gateway_addr, next_hop);
+            
+            let tcp_stream = TcpStream::connect(&gateway_addr).await
+                .map_err(|e| PrivoxyError::Connection(
+                    format!("Failed to connect to gateway {}: {}", gateway_addr, e)
+                ))?;
+            
+            match forward_spec.forward_type {
+                crate::config::ForwardType::Socks5 | crate::config::ForwardType::Socks5t => {
+                    let socks_stream = Socks5Stream::connect_with_socket(tcp_stream, next_hop.as_str())
+                        .await
+                        .map_err(|e| PrivoxyError::Connection(
+                            format!("SOCKS5 connect failed: {:?}", e)
+                        ))?;
+                    socks_stream.into_inner()
                 }
+                crate::config::ForwardType::Socks4 | crate::config::ForwardType::Socks4a => {
+                    let socks_stream = tokio_socks::tcp::socks4::Socks4Stream::connect_with_socket(
+                        tcp_stream, 
+                        next_hop.as_str()
+                    )
+                        .await
+                        .map_err(|e| PrivoxyError::Connection(
+                            format!("SOCKS4 connect failed: {:?}", e)
+                        ))?;
+                    socks_stream.into_inner()
+                }
+                _ => tcp_stream, // Should not happen for SOCKS types
             }
-            None => {
-                let target_addr = format!("{}:{}", host, port);
-                TcpStream::connect(&target_addr).await
-                    .map_err(|e| PrivoxyError::Connection(
-                        format!("Failed to connect to {}: {}", target_addr, e)
-                    ))
-            }
-        }
+        } else if let Some(ref forward_host) = forward_spec.forward_host {
+            // Direct HTTP proxy connection (no SOCKS)
+            let proxy_addr = format!("{}:{}", forward_host, forward_spec.forward_port);
+            debug!("Connecting to HTTP proxy {} to reach {}:{}", proxy_addr, host, port);
+            TcpStream::connect(&proxy_addr).await
+                .map_err(|e| PrivoxyError::Connection(
+                    format!("Failed to connect to HTTP proxy {}: {}", proxy_addr, e)
+                ))?
+        } else {
+            // Truly direct connection
+            let target_addr = format!("{}:{}", host, port);
+            debug!("Connecting directly to {}", target_addr);
+            TcpStream::connect(&target_addr).await
+                .map_err(|e| PrivoxyError::Connection(
+                    format!("Failed to connect to {}: {}", target_addr, e)
+                ))?
+        };
+
+        Ok((stream, forward_spec))
     }
 
     async fn handle_connect(&mut self, request: HttpRequest) -> PrivoxyResult<()> {
@@ -286,7 +277,7 @@ impl ConnectionHandler {
         }
 
         match self.connect_to_target(&request.host, request.port).await {
-            Ok(stream) => {
+            Ok((stream, _)) => {
                 self.server_stream = Some(stream);
 
                 let response = create_connect_response();
@@ -348,16 +339,10 @@ impl ConnectionHandler {
         if let Some(ref a) = action {
             self.apply_action_to_request(a, &mut request, &url, &mut action_ctx);
         }
-        
-        self.apply_client_header_filters(&mut request, &url);
 
-        // Get forward spec to determine request format
-        let forward_spec = self.find_forward_spec(&target_host, target_port);
-        let is_forward_webserver = forward_spec.as_ref().map_or(false, |(_, _, ft)| *ft == ForwardType::ForwardWebserver);
-        let is_http_proxy = forward_spec.as_ref().map_or(false, |(_, _, ft)| *ft == ForwardType::Http);
-
-        let mut server_stream = match self.connect_to_target(&target_host, target_port).await {
-            Ok(stream) => stream,
+        // Get forward spec and connect
+        let (mut server_stream, forward_spec) = match self.connect_to_target(&target_host, target_port).await {
+            Ok(res) => res,
             Err(e) => {
                 error!("Failed to connect to {}:{}: {}", target_host, target_port, e);
                 let response = create_error_response(502, &format!("Cannot connect to {}:{}", target_host, target_port));
@@ -365,16 +350,16 @@ impl ConnectionHandler {
                 return Ok(());
             }
         };
-
+        
         // Build request bytes with correct format based on forward type
-        let request_bytes = self.build_request_bytes(&request, is_forward_webserver, is_http_proxy);
+        let request_bytes = self.build_request_bytes(&request, &forward_spec);
         server_stream.write_all(&request_bytes).await?;
-
+        
         self.forward_response(&mut server_stream, &url, &mut action_ctx).await
     }
 
     /// Build HTTP request bytes with correct request line format
-    fn build_request_bytes(&self, request: &HttpRequest, is_forward_webserver: bool, is_http_proxy: bool) -> Bytes {
+    fn build_request_bytes(&self, request: &HttpRequest, forward_spec: &crate::config::ForwardSpec) -> Bytes {
         use std::fmt::Write;
         
         let mut result = String::new();
@@ -383,6 +368,10 @@ impl ConnectionHandler {
         // For ForwardWebserver: send only path (e.g., "GET /path HTTP/1.1")
         // For HTTP proxy: send full URL (e.g., "GET http://host/path HTTP/1.1")
         // For direct connection: send only path
+        
+        // If there's an HTTP parent proxy, we need the full URL
+        let is_http_proxy = forward_spec.forward_host.is_some() && forward_spec.forward_type != crate::config::ForwardType::ForwardWebserver;
+
         if is_http_proxy && !request.is_ssl {
             // HTTP proxy needs full URL
             let scheme = if request.is_ssl { "https" } else { "http" };
@@ -572,135 +561,6 @@ impl ConnectionHandler {
         }
     }
 
-    fn apply_server_header_filters(&self, response: &mut HttpResponse, url: &str) {
-        let config = self.config.read();
-        
-        if config.filters.is_empty() {
-            return;
-        }
-
-        let action = find_action_for_url(url, &config);
-
-        let filter_names: Vec<&str> = if let Some(ref a) = action {
-            a.filter_names.iter().map(|s| s.as_str()).collect()
-        } else {
-            return;
-        };
-
-        let mut variables = FilterVariables::default();
-        if let Some(pos) = url.find('/') {
-            variables.host = url[..pos].to_string();
-            variables.path = format!("/{}", &url[pos..]);
-        } else {
-            variables.host = url.to_string();
-        }
-        variables.url = format!("http://{}", url);
-        variables.origin = self.client_addr.to_string();
-
-        let mut headers_to_remove = Vec::new();
-        let mut headers_to_add: Vec<(String, String)> = Vec::new();
-
-        for filter_name in &filter_names {
-            if let Some(filter) = config.filters.iter().find(|f| &f.name == filter_name) {
-                if !filter.enabled || filter.filter_type != FilterType::ServerHeader {
-                    continue;
-                }
-
-                for (header_name, header_value) in &response.headers {
-                    let header_line = format!("{}: {}", header_name, header_value);
-                    
-                    let filtered = if filter.dynamic {
-                        filter.apply_with_variables(&header_line, Some(&variables))
-                    } else {
-                        filter.apply(&header_line)
-                    };
-
-                    if filtered != header_line {
-                        if filtered.is_empty() {
-                            headers_to_remove.push(header_name.clone());
-                            debug!("Removing header '{}' via filter '{}'", header_name, filter.name);
-                        } else if let Some((new_name, new_value)) = filtered.split_once(':') {
-                            headers_to_remove.push(header_name.clone());
-                            headers_to_add.push((new_name.trim().to_string(), new_value.trim().to_string()));
-                            debug!("Modified header '{}' via filter '{}'", header_name, filter.name);
-                        }
-                    }
-                }
-            }
-        }
-
-        for header in headers_to_remove {
-            response.headers.remove(&header);
-        }
-        for (name, value) in headers_to_add {
-            response.headers.insert(name, value);
-        }
-    }
-
-    fn apply_client_header_filters(&self, request: &mut HttpRequest, url: &str) {
-        let config = self.config.read();
-        
-        if config.filters.is_empty() {
-            return;
-        }
-
-        let action = find_action_for_url(url, &config);
-
-        let filter_names: Vec<&str> = if let Some(ref a) = action {
-            a.filter_names.iter().map(|s| s.as_str()).collect()
-        } else {
-            return;
-        };
-
-        let mut variables = FilterVariables::default();
-        if let Some(pos) = url.find('/') {
-            variables.host = url[..pos].to_string();
-            variables.path = format!("/{}", &url[pos..]);
-        } else {
-            variables.host = url.to_string();
-        }
-        variables.url = format!("http://{}", url);
-        variables.origin = self.client_addr.to_string();
-
-        let mut headers_to_remove = Vec::new();
-        let mut headers_to_add: Vec<(String, String)> = Vec::new();
-
-        for filter_name in &filter_names {
-            if let Some(filter) = config.filters.iter().find(|f| &f.name == filter_name) {
-                if !filter.enabled || filter.filter_type != FilterType::ClientHeader {
-                    continue;
-                }
-
-                for (header_name, header_value) in &request.headers {
-                    let header_line = format!("{}: {}", header_name, header_value);
-                    
-                    let filtered = if filter.dynamic {
-                        filter.apply_with_variables(&header_line, Some(&variables))
-                    } else {
-                        filter.apply(&header_line)
-                    };
-
-                    if filtered != header_line {
-                        if filtered.is_empty() {
-                            headers_to_remove.push(header_name.clone());
-                            debug!("Removing request header '{}' via filter '{}'", header_name, filter.name);
-                        } else if let Some((new_name, new_value)) = filtered.split_once(':') {
-                            headers_to_remove.push(header_name.clone());
-                            headers_to_add.push((new_name.trim().to_string(), new_value.trim().to_string()));
-                            debug!("Modified request header '{}' via filter '{}'", header_name, filter.name);
-                        }
-                    }
-                }
-            }
-        }
-
-        for header in headers_to_remove {
-            request.headers.remove(&header);
-        }
-        for (name, value) in headers_to_add {
-            request.headers.insert(name, value);
-        }
-    }
 
     fn apply_action_to_request(&self, action: &crate::config::Action, request: &mut HttpRequest, url: &str, action_ctx: &mut ActionContext) {
         let config = self.config.read();
@@ -715,26 +575,14 @@ impl ConnectionHandler {
         variables.url = format!("http://{}", url);
         variables.origin = self.client_addr.to_string();
         
-        // Apply client header filters (ported from filter_header in parsers.c)
-        apply_client_header_filters(&mut request.headers, &config, action, &variables);
+        // Apply centralized header pipeline
+        apply_client_header_actions(&mut request.headers, &config, action, &variables, &self.client_addr.to_string());
         
+        // Taggers (from parsers.c: execute_header_tagger)
         apply_client_header_taggers(&request.headers, &config, action, action_ctx, &variables);
         
-        apply_add_header(&mut request.headers, action);
-        apply_crunch_client_header(&mut request.headers, action);
-        apply_crunch_outgoing_cookies(&mut request.headers, action);
-        apply_crunch_if_none_match(&mut request.headers, action);
-        apply_change_x_forwarded_for(&mut request.headers, action, &self.client_addr.to_string());
-        apply_hide_referrer(&mut request.headers, action);
-        apply_hide_user_agent(&mut request.headers, action);
-        apply_send_user_agent(&mut request.headers, action);
-        apply_hide_from_header(&mut request.headers, action);
-        apply_hide_accept_language(&mut request.headers, action);
-        apply_hide_if_modified_since(&mut request.headers, action);
-        apply_hide_content_disposition(&mut request.headers, action);
-        apply_prevent_compression(&mut request.headers, action);
+        // Handle non-header modifications
         apply_downgrade_http_version(&mut request.version, action);
-        apply_session_cookies_only(&mut request.headers, action);
     }
 
     fn apply_action_to_response(&self, action: &crate::config::Action, response: &mut HttpResponse, url: &str, action_ctx: &mut ActionContext) {
@@ -750,15 +598,13 @@ impl ConnectionHandler {
         variables.url = format!("http://{}", url);
         variables.origin = self.client_addr.to_string();
         
-        // Apply server header filters (port from filter_header in parsers.c)
-        apply_server_header_filters(&mut response.headers, &config, action, &variables);
+        // Apply centralized header pipeline
+        apply_server_header_actions(&mut response.headers, &config, action, &variables);
         
+        // Taggers
         apply_server_header_taggers(&response.headers, &config, action, action_ctx, &variables);
         
-        apply_crunch_incoming_cookies(&mut response.headers, action);
-        apply_crunch_server_header(&mut response.headers, action);
-        apply_content_type_overwrite(&mut response.headers, action);
-        apply_overwrite_last_modified(&mut response.headers, action);
+        // Handle non-header modifications
         apply_limit_cookie_lifetime(&mut response.headers, action);
         apply_force_text_mode(&mut response.headers, action);
         

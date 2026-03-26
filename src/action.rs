@@ -1,9 +1,6 @@
 use std::collections::HashSet;
-use std::sync::Arc;
-
-use parking_lot::RwLock;
 use regex::Regex;
-use tracing::{debug, info, warn};
+use tracing::debug;
 
 use crate::config::{Action, Config};
 use crate::error::PrivoxyResult;
@@ -600,6 +597,74 @@ pub fn apply_crunch_client_header(
     }
 }
 
+pub fn apply_client_header_actions(
+    headers: &mut std::collections::HashMap<String, String>,
+    config: &Config,
+    action: &Action,
+    variables: &FilterVariables,
+    client_addr: &str,
+) {
+    // 1. Header Filters (parsers.c: filter_header)
+    apply_client_header_filters(headers, config, action, variables);
+
+    // 2. Crunching (parsers.c: crunch_client_header)
+    apply_crunch_client_header(headers, action);
+    
+    if action.crunch_outgoing_cookies {
+        headers.remove("Cookie");
+        debug!("Crunched outgoing cookies");
+    }
+
+    if action.crunch_if_none_match {
+        headers.remove("If-None-Match");
+        debug!("Crunched If-None-Match");
+    }
+
+    // 3. Modifying specific headers
+    apply_hide_referrer(headers, action);
+    
+    if let Some(ref ua) = action.hide_user_agent {
+        headers.insert("User-Agent".to_string(), ua.clone());
+        debug!("Set User-Agent to: {}", ua);
+    } else if let Some(ref ua) = action.send_user_agent {
+        headers.insert("User-Agent".to_string(), ua.clone());
+        debug!("Set User-Agent to: {}", ua);
+    }
+    
+    apply_hide_from_header(headers, action);
+    apply_hide_accept_language(headers, action);
+    apply_hide_if_modified_since(headers, action);
+    apply_change_x_forwarded_for(headers, action, client_addr);
+    apply_prevent_compression(headers, action);
+    apply_session_cookies_only(headers, action);
+
+    // 4. Adding headers
+    apply_add_header(headers, action);
+}
+
+pub fn apply_server_header_actions(
+    headers: &mut std::collections::HashMap<String, String>,
+    config: &Config,
+    action: &Action,
+    variables: &FilterVariables,
+) {
+    // 1. Header Filters
+    apply_server_header_filters(headers, config, action, variables);
+
+    // 2. Crunching
+    apply_crunch_server_header(headers, action);
+    
+    if action.crunch_incoming_cookies {
+        headers.remove("Set-Cookie");
+        debug!("Crunched incoming cookies");
+    }
+
+    // 3. Modifying specific headers
+    apply_hide_content_disposition(headers, action);
+    apply_overwrite_last_modified(headers, action);
+    apply_content_type_overwrite(headers, action);
+}
+
 pub fn apply_crunch_server_header(
     headers: &mut std::collections::HashMap<String, String>,
     action: &Action,
@@ -614,36 +679,6 @@ pub fn apply_crunch_server_header(
             debug!("Crunching server header: {}", header);
             headers.remove(&header);
         }
-    }
-}
-
-pub fn apply_crunch_outgoing_cookies(
-    headers: &mut std::collections::HashMap<String, String>,
-    action: &Action,
-) {
-    if action.crunch_outgoing_cookies {
-        headers.remove("Cookie");
-        debug!("Crunching outgoing cookies");
-    }
-}
-
-pub fn apply_crunch_incoming_cookies(
-    headers: &mut std::collections::HashMap<String, String>,
-    action: &Action,
-) {
-    if action.crunch_incoming_cookies {
-        headers.remove("Set-Cookie");
-        debug!("Crunching incoming cookies");
-    }
-}
-
-pub fn apply_crunch_if_none_match(
-    headers: &mut std::collections::HashMap<String, String>,
-    action: &Action,
-) {
-    if action.crunch_if_none_match {
-        headers.remove("If-None-Match");
-        debug!("Crunching If-None-Match header");
     }
 }
 
