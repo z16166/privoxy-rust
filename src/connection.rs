@@ -121,13 +121,13 @@ impl ConnectionHandler {
                         match crate::loaders::parse_forward_directive(forward_override) {
                             Ok(Some(mut spec)) => {
                                 // Pattern in override is not used, it's just a proxy spec
-                                spec.pattern = pattern.clone();
+                                spec.pattern = pattern.to_string();
                                 return Some(spec);
                             }
                             Ok(None) => {
                                 // Handle forward . case - direct connection
                                 let spec = crate::config::ForwardSpec {
-                                    pattern: pattern.clone(),
+                                    pattern: pattern.to_string(),
                                     forward_type: crate::config::ForwardType::Direct,
                                     gateway_host: None,
                                     gateway_port: 0,

@@ -392,6 +392,48 @@ impl CgiHandler {
         params
     }
 
+    /// Check if the referrer is safe for sensitive CGI actions
+    fn referrer_is_safe(&self, req: &HyperRequest<Incoming>) -> bool {
+        let referer = match req.headers().get(hyper::header::REFERER) {
+            Some(r) => match r.to_str() {
+                Ok(s) => s,
+                Err(_) => return false,
+            },
+            None => {
+                info!("Denying access to {:?}. No referrer found.", req.uri());
+                return false;
+            }
+        };
+
+        // Standard CGI prefixes
+        let my_hostname = self.config.listen_addresses.first()
+            .map(|s| s.addr.as_str())
+            .unwrap_or("127.0.0.1");
+        let my_port = self.config.listen_addresses.first()
+            .map(|s| s.port.to_string())
+            .unwrap_or_else(|| "8118".to_string());
+
+        let prefixes = [
+            format!("http://{}:{}/", my_hostname, my_port),
+            format!("http://config.privoxy.org/"),
+            format!("http://p.p/"),
+            format!("https://config.privoxy.org/"),
+            format!("https://p.p/"),
+        ];
+
+        if prefixes.iter().any(|p| referer.starts_with(p)) {
+            return true;
+        }
+
+        // Trusted referrers from config
+        if self.config.trusted_cgi_referers.iter().any(|p| referer.starts_with(p)) {
+            return true;
+        }
+
+        info!("Denying access to {:?}. Referrer {:?} is not trustworthy.", req.uri(), referer);
+        false
+    }
+
     pub async fn handle_request(&self, req: HyperRequest<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
         let path = req.uri().path();
         let method = req.method().clone();
@@ -424,60 +466,170 @@ impl CgiHandler {
             
             // Client tags - only if FEATURE_CLIENT_TAGS is enabled
             #[cfg(feature = "client-tags")]
-            "/client-tags" => self.generate_client_tags(),
+            "/client-tags" => {
+                if !self.referrer_is_safe(&req) {
+                    self.generate_error_referer(&req)
+                } else {
+                    self.generate_client_tags()
+                }
+            },
             #[cfg(feature = "client-tags")]
-            "/toggle-client-tag" => self.generate_toggle_client_tag(&req),
+            "/toggle-client-tag" => {
+                if !self.referrer_is_safe(&req) {
+                    self.generate_error_referer(&req)
+                } else {
+                    self.generate_toggle_client_tag(&req)
+                }
+            },
             
             // Edit actions - only if FEATURE_CGI_EDIT_ACTIONS is enabled
             #[cfg(feature = "cgi-edit-actions")]
-            "/edit-actions" | "/edit-actions-list" => self.generate_edit_actions_list(),
-            #[cfg(feature = "cgi-edit-actions")]
-            "/edit-actions-file" => {
-                // Get filename from query string
-                if let Some(query) = req.uri().query() {
-                    let params: HashMap<&str, &str> = query.split('&')
-                        .filter_map(|s| {
-                            let mut parts = s.splitn(2, '=');
-                            parts.next().and_then(|key| parts.next().map(|val| (key, val)))
-                        })
-                        .collect();
-                    if let Some(file) = params.get("file") {
-                        self.generate_edit_actions_file(file)
-                    } else {
-                        self.generate_simple_page("Error", "Missing file parameter")
-                    }
+            "/edit-actions" | "/edit-actions-list" => {
+                if !self.config.enable_edit_actions {
+                    self.generate_error_disabled("editing actions")
+                } else if !self.referrer_is_safe(&req) {
+                    self.generate_error_referer(&req)
                 } else {
-                    self.generate_simple_page("Error", "Missing query string")
+                    self.generate_edit_actions_list()
                 }
             },
             #[cfg(feature = "cgi-edit-actions")]
-            "/edit-actions-for-url" => self.generate_edit_actions_for_url(&req),
+            "/edit-actions-file" => {
+                if !self.config.enable_edit_actions {
+                    self.generate_error_disabled("editing actions")
+                } else if !self.referrer_is_safe(&req) {
+                    self.generate_error_referer(&req)
+                } else {
+                    // Get filename from query string
+                    if let Some(query) = req.uri().query() {
+                        let params: HashMap<&str, &str> = query.split('&')
+                            .filter_map(|s| {
+                                let mut parts = s.splitn(2, '=');
+                                parts.next().and_then(|key| parts.next().map(|val| (key, val)))
+                            })
+                            .collect();
+                        if let Some(file) = params.get("file") {
+                            self.generate_edit_actions_file(file)
+                        } else {
+                            self.generate_simple_page("Error", "Missing file parameter")
+                        }
+                    } else {
+                        self.generate_simple_page("Error", "Missing query string")
+                    }
+                }
+            },
             #[cfg(feature = "cgi-edit-actions")]
-            "/eaa" => self.generate_add_url_form(),
+            "/edit-actions-for-url" | "/eafu" => {
+                if !self.config.enable_edit_actions {
+                    self.generate_error_disabled("editing actions")
+                } else if !self.referrer_is_safe(&req) {
+                    self.generate_error_referer(&req)
+                } else {
+                    self.generate_edit_actions_for_url(&req)
+                }
+            },
             #[cfg(feature = "cgi-edit-actions")]
-            "/eau" => self.generate_edit_url_form(&req),
+            "/eaa" => {
+                if !self.config.enable_edit_actions {
+                    self.generate_error_disabled("editing actions")
+                } else if !self.referrer_is_safe(&req) {
+                    self.generate_error_referer(&req)
+                } else {
+                    self.generate_add_url_form()
+                }
+            },
             #[cfg(feature = "cgi-edit-actions")]
-            "/ear" => self.generate_remove_url_form(&req),
+            "/eau" => {
+                if !self.config.enable_edit_actions {
+                    self.generate_error_disabled("editing actions")
+                } else if !self.referrer_is_safe(&req) {
+                    self.generate_error_referer(&req)
+                } else {
+                    self.generate_edit_url_form(&req)
+                }
+            },
             #[cfg(feature = "cgi-edit-actions")]
-            "/eal" => self.generate_edit_actions_list(),
+            "/ear" => {
+                if !self.config.enable_edit_actions {
+                    self.generate_error_disabled("editing actions")
+                } else if !self.referrer_is_safe(&req) {
+                    self.generate_error_referer(&req)
+                } else {
+                    self.generate_remove_url_form(&req)
+                }
+            },
             #[cfg(feature = "cgi-edit-actions")]
-            "/eafu" => self.generate_edit_actions_for_url(&req),
+            "eal" => {
+                if !self.config.enable_edit_actions {
+                    self.generate_error_disabled("editing actions")
+                } else if !self.referrer_is_safe(&req) {
+                    self.generate_error_referer(&req)
+                } else {
+                    self.generate_edit_actions_list()
+                }
+            },
             #[cfg(feature = "cgi-edit-actions")]
-            "/eas" => self.generate_submit_changes(),
+            "/eas" => {
+                if !self.config.enable_edit_actions {
+                    self.generate_error_disabled("editing actions")
+                } else if !self.referrer_is_safe(&req) {
+                    self.generate_error_referer(&req)
+                } else {
+                    self.generate_submit_changes()
+                }
+            },
             #[cfg(feature = "cgi-edit-actions")]
-            "/easa" => self.generate_add_section_form(),
+            "/easa" => {
+                if !self.config.enable_edit_actions {
+                    self.generate_error_disabled("editing actions")
+                } else if !self.referrer_is_safe(&req) {
+                    self.generate_error_referer(&req)
+                } else {
+                    self.generate_add_section_form()
+                }
+            },
             #[cfg(feature = "cgi-edit-actions")]
-            "/easr" => self.generate_remove_section_form(),
+            "/easr" => {
+                if !self.config.enable_edit_actions {
+                    self.generate_error_disabled("editing actions")
+                } else if !self.referrer_is_safe(&req) {
+                    self.generate_error_referer(&req)
+                } else {
+                    self.generate_remove_section_form()
+                }
+            },
             #[cfg(feature = "cgi-edit-actions")]
-            "/eass" => self.generate_swap_sections_form(),
+            "/eass" => {
+                if !self.config.enable_edit_actions {
+                    self.generate_error_disabled("editing actions")
+                } else if !self.referrer_is_safe(&req) {
+                    self.generate_error_referer(&req)
+                } else {
+                    self.generate_swap_sections_form()
+                }
+            },
             
             // Toggle - only if FEATURE_TOGGLE is enabled
             #[cfg(feature = "toggle")]
-            "/toggle" => self.generate_toggle(),
+            "/toggle" => {
+                if !self.config.enable_remote_toggle {
+                    self.generate_error_disabled("remote toggle")
+                } else if !self.referrer_is_safe(&req) {
+                    self.generate_error_referer(&req)
+                } else {
+                    self.generate_toggle()
+                }
+            },
             
             // Graceful termination - only if FEATURE_GRACEFUL_TERMINATION is enabled
             #[cfg(feature = "graceful-termination")]
-            "/die" => self.generate_die(),
+            "/die" => {
+                if !self.referrer_is_safe(&req) {
+                    self.generate_error_referer(&req)
+                } else {
+                    self.generate_die()
+                }
+            },
             
             // Static resources - always available
             "/error-favicon.ico" => return self.send_file("error-favicon.ico", "image/x-icon"),
@@ -1154,6 +1306,14 @@ impl CgiHandler {
         )
     }
 
+    fn generate_error_referer(&self, req: &HyperRequest<Incoming>) -> String {
+        self.generate_simple_page("CGI Referer Error", &format!("Privoxy denied access to {} because the referrer is not trustworthy.", req.uri()))
+    }
+
+    fn generate_error_disabled(&self, feature: &str) -> String {
+        self.generate_simple_page("Feature Disabled", &format!("Access to {} is disabled in the configuration.", feature))
+    }
+
     fn generate_favicon(&self, default: bool) -> String {
         // Return a simple HTML page since we're not generating actual ICO files
         format!(
@@ -1267,7 +1427,7 @@ impl CgiHandler {
     /// Generate show-request page using template
     fn generate_show_request(&self) -> String {
         if let Some(template) = self.load_template("show-request") {
-            let mut symbols = self.create_common_symbols();
+            let symbols = self.create_common_symbols();
             // Add request-specific symbols here when implemented
             self.render_template(&template, &symbols)
         } else {
@@ -1278,7 +1438,7 @@ impl CgiHandler {
     /// Generate show-url-info page using template
     fn generate_show_url_info(&self) -> String {
         if let Some(template) = self.load_template("show-url-info") {
-            let mut symbols = self.create_common_symbols();
+            let symbols = self.create_common_symbols();
             // Add URL info-specific symbols here when implemented
             self.render_template(&template, &symbols)
         } else {

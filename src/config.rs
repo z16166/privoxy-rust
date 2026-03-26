@@ -151,6 +151,12 @@ pub struct Action {
     pub ignore_certificate_errors: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ClientSpecificTag {
+    pub name: String,
+    pub description: String,
+}
+
 impl Default for Action {
     fn default() -> Self {
         Self {
@@ -272,6 +278,10 @@ pub struct Config {
     pub file_modifications: Vec<FileModification>,
     #[serde(skip)]
     pub reload_requested: bool,
+    pub client_header_order: Vec<String>,
+    pub client_specific_tags: Vec<ClientSpecificTag>,
+    pub accept_intercepted_requests: bool,
+    pub client_tag_lifetime: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,6 +341,10 @@ impl Default for Config {
             config_file: None,
             file_modifications: Vec::new(),
             reload_requested: false,
+            client_header_order: Vec::new(),
+            client_specific_tags: Vec::new(),
+            accept_intercepted_requests: false,
+            client_tag_lifetime: 60, // Default to 60 seconds
         }
     }
 }
@@ -453,11 +467,12 @@ impl Config {
     pub fn parse(content: &str) -> PrivoxyResult<Self> {
         let mut config = Config::default();
 
-        for line in content.lines() {
+        let reader = std::io::BufReader::new(content.as_bytes());
+        let lines = crate::util::read_lines(reader);
+        for line in lines {
             let line = line.trim();
 
-            // Skip empty lines and comments
-            if line.is_empty() || line.starts_with('#') {
+            if line.is_empty() {
                 continue;
             }
 
@@ -600,6 +615,26 @@ impl Config {
                     "proxy-info-url" => {
                         config.proxy_info_url = Some(value.to_string());
                     }
+                    "client-header-order" => {
+                        config.client_header_order = value.split_whitespace()
+                            .map(|s| s.to_string())
+                            .collect();
+                    }
+                    "client-specific-tag" => {
+                        if let Some((name, description)) = value.split_once(' ') {
+                            config.client_specific_tags.push(ClientSpecificTag {
+                                name: name.trim().to_string(),
+                                description: description.trim().to_string(),
+                            });
+                        }
+                    }
+                    "client-tag-lifetime" => {
+                        config.client_tag_lifetime = value.parse()
+                            .map_err(|_| PrivoxyError::Config(format!("Invalid client-tag-lifetime: {}", value)))?;
+                    }
+                    "accept-intercepted-requests" => {
+                        config.accept_intercepted_requests = parse_bool(value)?;
+                    }
                     "log-file" => {
                         config.log_file = Some(PathBuf::from(value));
                     }
@@ -614,10 +649,6 @@ impl Config {
                     "forwarded-connect-retries" => {
                         config.forwarded_connect_retries = value.parse()
                             .map_err(|_| PrivoxyError::Config(format!("Invalid retries: {}", value)))?;
-                    }
-                    "client-specific-tag" => {
-                        // Client-specific tags are handled by client_tags module
-                        debug!("Client-specific-tag directive: {}", value);
                     }
                     "header-order" => {
                         // Header ordering is handled during HTTP parsing
@@ -812,11 +843,8 @@ fn parse_forward_spec(value: &str, forward_type: ForwardType) -> PrivoxyResult<O
     };
 
     match spec.forward_type {
-        ForwardType::Direct | ForwardType::ForwardWebserver => {
-            // No proxies
-        }
-        ForwardType::Http => {
-            // forward pattern http-proxy
+        ForwardType::Direct | ForwardType::ForwardWebserver | ForwardType::Http => {
+            // forward pattern (.|http-proxy)
             if parts.len() >= 2 {
                 let (host, port) = parse_proxy_spec(parts[1], 8000)?;
                 if host != "0.0.0.0" {

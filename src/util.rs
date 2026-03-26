@@ -337,6 +337,77 @@ pub fn ssplit_n<'a>(str: &'a str, delim: Option<&str>, max_results: usize) -> Ve
         .collect()
 }
 
+/// Read and process lines from a BufRead, handling line continuation (\) and escaped comments (\#)
+/// Ported from the logic in loaders.c and loadcfg.c
+pub fn read_lines<R: std::io::BufRead>(reader: R) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current_line = String::new();
+
+    for line_res in reader.lines() {
+        if let Ok(line) = line_res {
+            // Handle line continuation: if line ends with \, remove it and continue
+            let trimmed_line = line.trim_end();
+            if trimmed_line.ends_with('\\') {
+                // Find index of the last \ (could be trailing spaces before it)
+                if let Some(idx) = line.rfind('\\') {
+                    current_line.push_str(&line[..idx]);
+                    continue;
+                }
+            }
+
+            current_line.push_str(&line);
+
+            // Process the complete line (handle comments, escaped hashes, and trimming)
+            let processed = process_line(&current_line);
+            if !processed.is_empty() {
+                lines.push(processed);
+            }
+            current_line.clear();
+        }
+    }
+    
+    // Handle case where last line ends with \
+    if !current_line.is_empty() {
+        let processed = process_line(&current_line);
+        if !processed.is_empty() {
+            lines.push(processed);
+        }
+    }
+    
+    lines
+}
+
+/// Process a single (possibly joined) line: strip comments and handle \#
+fn process_line(line: &str) -> String {
+    let mut comment_start = None;
+    let mut escaped = false;
+    
+    // Find the first unescaped #
+    for (i, c) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            continue;
+        }
+        if c == '#' {
+            comment_start = Some(i);
+            break;
+        }
+    }
+
+    let line_content = if let Some(idx) = comment_start {
+        &line[..idx]
+    } else {
+        line
+    };
+
+    // Replace \# with # in the non-comment portion
+    line_content.replace("\\#", "#").trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,5 +508,19 @@ mod tests {
         
         let result = ssplit_n("a,b,c,d,e", Some(","), 2);
         assert_eq!(result, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_read_lines() {
+        let input = "line 1\nline 2 \\\ncontinued\nline 3 # comment\nline 4 \\# literal hash\n  \\\n  empty continued line";
+        let reader = std::io::BufReader::new(input.as_bytes());
+        let lines = read_lines(reader);
+        
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[0], "line 1");
+        assert_eq!(lines[1], "line 2 continued");
+        assert_eq!(lines[2], "line 3");
+        assert_eq!(lines[3], "line 4 # literal hash");
+        assert_eq!(lines[4], "empty continued line");
     }
 }

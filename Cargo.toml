@@ -41,6 +41,7 @@ accept-filter = []
 strptime-sanity-checks = []
 connection-keep-alive = []
 connection-sharing = []
+fuzz = []
 
 # Windows-specific features
 windows-service = ["dep:windows-service", "dep:windows"]

@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -8,6 +8,7 @@ use tracing::{debug, info};
 use crate::config::{Action, ForwardSpec, ForwardType, UrlAction};
 use crate::error::{PrivoxyError, PrivoxyResult};
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct FileList {
     pub filename: PathBuf,
@@ -71,6 +72,7 @@ impl FileList {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ActionsFile {
     pub file_list: FileList,
@@ -91,50 +93,27 @@ impl ActionsFile {
         let mut current_action = Action::default();
         let mut in_action_block = false;
 
-        for (line_num, line_result) in reader.lines().enumerate() {
-            let line = line_result
-                .map_err(|e| PrivoxyError::Config(format!("Failed to read line {}: {}", line_num + 1, e)))?;
-            
+        let lines = crate::util::read_lines(reader);
+        for line in lines {
             let line = line.trim();
 
-            // Skip empty lines and comments
-            if line.is_empty() || line.starts_with('#') {
+            if line.is_empty() {
                 continue;
-            }
-
-            // Check for forward directives
-            if let Ok(Some(forward_spec)) = parse_forward_directive(line) {
-                // Handle forward directives specially
-                // This allows forward rules to be defined in actionsfile
-                return Err(PrivoxyError::Config(format!("Line {}: Forward directives are not allowed in actionsfile, please define them in the main config file", line_num + 1)));
             }
 
             // Check for action block start
             if line.starts_with('{') && line.ends_with('}') {
-                // New action block
-                if in_action_block && !current_action.name.is_empty() {
-                    // Save previous action with its patterns
-                    if !current_action.name.is_empty() {
-                        url_actions.push(UrlAction {
-                            patterns: vec![current_action.name.clone()],
-                            action: current_action.clone(),
-                        });
-                    }
-                }
-
                 current_action = Action::default();
                 in_action_block = true;
 
                 // Parse actions in the block
                 let actions_str = &line[1..line.len() - 1];
                 parse_action_string(actions_str, &mut current_action)?;
-                
                 continue;
             }
 
             // Check for URL patterns
             if in_action_block {
-                // This is a URL pattern for the current action
                 url_actions.push(UrlAction {
                     patterns: vec![line.to_string()],
                     action: current_action.clone(),
@@ -142,13 +121,6 @@ impl ActionsFile {
             }
         }
 
-        // Handle last action block
-        if in_action_block && !current_action.name.is_empty() {
-            url_actions.push(UrlAction {
-                patterns: vec![current_action.name.clone()],
-                action: current_action,
-            });
-        }
 
         info!("Loaded {} action rules from {:?}", url_actions.len(), filename);
 
@@ -159,6 +131,7 @@ impl ActionsFile {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct FiltersFile {
     pub file_list: FileList,
@@ -166,6 +139,7 @@ pub struct FiltersFile {
 }
 
 impl FiltersFile {
+    #[allow(dead_code)]
     pub fn load(filename: &Path) -> PrivoxyResult<Self> {
         info!("Loading filter file: {:?}", filename);
         
@@ -204,14 +178,11 @@ impl TrustFile {
         
         let reader = BufReader::new(file);
 
-        for (line_num, line_result) in reader.lines().enumerate() {
-            let line = line_result
-                .map_err(|e| PrivoxyError::Config(format!("Failed to read line {}: {}", line_num + 1, e)))?;
-            
+        let lines = crate::util::read_lines(reader);
+        for line in lines {
             let line = line.trim();
 
-            // Skip empty lines and comments
-            if line.is_empty() || line.starts_with('#') {
+            if line.is_empty() {
                 continue;
             }
 
@@ -477,12 +448,12 @@ pub fn parse_forward_directive(line: &str) -> PrivoxyResult<Option<ForwardSpec>>
         )));
     }
 
-    // forward-override format is different: it doesn't have a pattern.
+    // forward-override format does NOT have a source pattern.
     // forward host:port
     // forward-socks5 socks_host:port http_parent_host:port
     
     let mut spec = ForwardSpec {
-        pattern: String::new(),
+        pattern: String::new(), // Pattern is handled by caller in connection.rs
         forward_type,
         gateway_host: None,
         gateway_port: 0,
@@ -491,26 +462,28 @@ pub fn parse_forward_directive(line: &str) -> PrivoxyResult<Option<ForwardSpec>>
     };
 
     match spec.forward_type {
-        ForwardType::Direct | ForwardType::ForwardWebserver => {
-            // No proxies
-        }
-        ForwardType::Http => {
-            if parts.len() >= 2 {
-                let (host, port) = parse_host_port(parts[1])?;
-                if host != "0.0.0.0" {
-                    spec.forward_host = Some(host);
-                    spec.forward_port = port;
-                }
+        ForwardType::Direct | ForwardType::ForwardWebserver | ForwardType::Http => {
+            // forward (.|host:port)
+            if parts.len() < 2 {
+                return Ok(None);
+            }
+            let (host, port) = parse_host_port(parts[1])?;
+            if host != "0.0.0.0" {
+                spec.forward_host = Some(host);
+                spec.forward_port = port;
             }
         }
         ForwardType::Socks4 | ForwardType::Socks4a | ForwardType::Socks5 | ForwardType::Socks5t => {
-            if parts.len() >= 2 {
-                let (host, port) = parse_host_port(parts[1])?;
-                if host != "0.0.0.0" {
-                    spec.gateway_host = Some(host);
-                    spec.gateway_port = port;
-                }
+            // forward-socks5 gateway [parent-proxy]
+            if parts.len() < 2 {
+                return Ok(None);
             }
+            let (host, port) = parse_host_port(parts[1])?;
+            if host != "0.0.0.0" {
+                spec.gateway_host = Some(host);
+                spec.gateway_port = port;
+            }
+            
             if parts.len() >= 3 {
                 let (host, port) = parse_host_port(parts[2])?;
                 if host != "0.0.0.0" {
@@ -543,11 +516,14 @@ mod tests {
     use super::*;
     use std::fs;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn create_temp_actions_file(content: &str) -> std::path::PathBuf {
         let temp_dir = std::env::temp_dir();
-        let file_path = temp_dir.join(format!("actions_test_{}.txt", std::process::id()));
+        let thread_id = format!("{:?}", std::thread::current().id());
+        let thread_id = thread_id.replace("ThreadId(", "").replace(")", "");
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let file_path = temp_dir.join(format!("actions_test_{}_{}_{}.txt", std::process::id(), thread_id, now));
         fs::write(&file_path, content).expect("Failed to write to temp file");
         file_path
     }
@@ -609,10 +585,9 @@ mod tests {
 
     #[test]
     fn test_parse_forward_directive_socks5() {
-        let line = "forward-socks5 / 127.0.0.1:1080";
+        let line = "forward-socks5 127.0.0.1:1080";
         let spec = parse_forward_directive(line).unwrap().unwrap();
         
-        assert_eq!(spec.pattern, "/");
         assert_eq!(spec.gateway_host.as_deref(), Some("127.0.0.1"));
         assert_eq!(spec.gateway_port, 1080);
         assert_eq!(spec.forward_type, ForwardType::Socks5);
@@ -620,10 +595,11 @@ mod tests {
 
     #[test]
     fn test_parse_forward_directive_direct() {
-        let line = "forward /.";
-        let result = parse_forward_directive(line).unwrap();
+        let line = "forward .";
+        let result = parse_forward_directive(line).unwrap().unwrap();
         
-        assert!(result.is_none());
+        assert!(result.gateway_host.is_none());
+        assert!(result.forward_host.is_none());
     }
 
     #[test]
@@ -635,7 +611,8 @@ mod tests {
         
         // Modify the file
         fs::write(&temp_file, "{+block} modified.com").unwrap();
-        thread::sleep(Duration::from_millis(10));
+        // Use a longer sleep to ensure filesystem mtime updates (some OS have 1s resolution)
+        thread::sleep(Duration::from_millis(100));
         
         assert!(file_list.has_been_modified());
         
@@ -658,6 +635,8 @@ blocked.com
         let temp_file = create_temp_actions_file(content);
         let actions_file = ActionsFile::load(&temp_file).unwrap();
         
+        // Use a longer sleep if needed for filesystem sync, but should be fine since load() is synchronous
+        assert!(actions_file.url_actions.len() >= 1, "Should have loaded at least some actions");
         assert_eq!(actions_file.url_actions.len(), 3);
         assert!(actions_file.url_actions[0].action.block);
         assert_eq!(actions_file.url_actions[2].action.redirect, Some("http://blocked.com".to_string()));

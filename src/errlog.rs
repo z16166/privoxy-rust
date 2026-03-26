@@ -9,9 +9,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use chrono::{Local, DateTime, Timelike, Datelike};
 
 #[cfg(all(windows, feature = "windows-service"))]
-use windows::Win32::Foundation::HINSTANCE;
-#[cfg(all(windows, feature = "windows-service"))]
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use {
+};
 
 /// Log level constants - Ported from errlog.h
 pub const LOG_LEVEL_REQUEST: u32    = 0x0001;

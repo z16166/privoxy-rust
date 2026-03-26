@@ -29,8 +29,6 @@ use libui::controls::{VerticalBox, MultilineEntry, LayoutStrategy, TextEntry};
 use libui::menus::Menu;
 
 #[cfg(all(feature = "tray-icon", windows))]
-use windows::Win32::UI::WindowsAndMessaging::{LoadImageW, IMAGE_ICON, LR_DEFAULTSIZE};
-#[cfg(all(feature = "tray-icon", windows))]
 use windows::core::PCWSTR;
 #[cfg(all(feature = "tray-icon", windows))]
 use windows::Win32::Foundation::HINSTANCE;
@@ -129,26 +127,26 @@ impl TrayIconApp {
             
             // --- Step 1: Define global menus before creating window ---
             // File menu
-            let mut file_menu = Menu::new("File");
-            let mut show_window_item = file_menu.append_item("Show Window");
+            let file_menu = Menu::new("File");
+            let show_window_item = file_menu.append_item("Show Window");
             show_window_item.on_clicked(|_, _| {
                 info!("File -> Show Window clicked");
                 // Window is already shown, just bring to front if needed
             });
             file_menu.append_separator();
-            let mut exit_item = file_menu.append_item("Exit");
+            let exit_item = file_menu.append_item("Exit");
             exit_item.on_clicked(|_, _| {
                 info!("File -> Exit clicked");
                 std::process::exit(0);
             });
             
             // View menu - create items first to get references
-            let mut view_menu = Menu::new("View");
-            let mut clear_log_item = view_menu.append_item("Clear Log");
+            let view_menu = Menu::new("View");
+            let clear_log_item = view_menu.append_item("Clear Log");
             
             // Tools menu
-            let mut tools_menu = Menu::new("Tools");
-            let mut edit_config_item = tools_menu.append_item("Edit Config");
+            let tools_menu = Menu::new("Tools");
+            let edit_config_item = tools_menu.append_item("Edit Config");
             edit_config_item.on_clicked(|_, _| {
                 info!("Tools -> Edit Config clicked");
                 // Open config file with default editor
@@ -273,7 +271,7 @@ impl TrayIconApp {
             }
             
             // Help menu
-            let mut help_menu = Menu::new("Help");
+            let help_menu = Menu::new("Help");
             let mut gpl_item = help_menu.append_item("GPL");
             gpl_item.on_clicked(|_, _| {
                 info!("Help -> GPL clicked");
@@ -1062,8 +1060,8 @@ impl IconManager {
                     
                     if width == 0 || height == 0 {
                         // Clean up
-                        if !icon_info.hbmColor.is_invalid() { DeleteObject(icon_info.hbmColor); }
-                        if !icon_info.hbmMask.is_invalid() { DeleteObject(icon_info.hbmMask); }
+                        if !icon_info.hbmColor.is_invalid() { let _ = DeleteObject(icon_info.hbmColor); }
+                        if !icon_info.hbmMask.is_invalid() { let _ = DeleteObject(icon_info.hbmMask); }
                         return Err("Icon has zero dimensions".into());
                     }
                     
@@ -1103,9 +1101,9 @@ impl IconManager {
                     
                     // Clean up GDI objects
                     SelectObject(hdc, old_bmp);
-                    DeleteDC(hdc);
-                    if !icon_info.hbmColor.is_invalid() { DeleteObject(icon_info.hbmColor); }
-                    if !icon_info.hbmMask.is_invalid() { DeleteObject(icon_info.hbmMask); }
+                    let _ = DeleteDC(hdc);
+                    if !icon_info.hbmColor.is_invalid() { let _ = DeleteObject(icon_info.hbmColor); }
+                    if !icon_info.hbmMask.is_invalid() { let _ = DeleteObject(icon_info.hbmMask); }
                     
                     // Convert BGRA to RGBA
                     let mut rgba_data = vec![0u8; (width * height * 4) as usize];
@@ -1333,8 +1331,8 @@ fn load_icon() -> Result<tray_icon::Icon, Box<dyn std::error::Error>> {
                 let height = bmp.bmHeight as u32;
                 
                 if width == 0 || height == 0 {
-                    if !ii.hbmColor.is_invalid() { DeleteObject(ii.hbmColor); }
-                    if !ii.hbmMask.is_invalid() { DeleteObject(ii.hbmMask); }
+                    if !ii.hbmColor.is_invalid() { let _ = DeleteObject(ii.hbmColor); }
+                    if !ii.hbmMask.is_invalid() { let _ = DeleteObject(ii.hbmMask); }
                     return Err("Icon has zero dimensions".into());
                 }
                 
@@ -1370,9 +1368,9 @@ fn load_icon() -> Result<tray_icon::Icon, Box<dyn std::error::Error>> {
                 );
                 
                 SelectObject(hdc, old_bmp);
-                DeleteDC(hdc);
-                if !ii.hbmColor.is_invalid() { DeleteObject(ii.hbmColor); }
-                if !ii.hbmMask.is_invalid() { DeleteObject(ii.hbmMask); }
+                let _ = DeleteDC(hdc);
+                if !ii.hbmColor.is_invalid() { let _ = DeleteObject(ii.hbmColor); }
+                if !ii.hbmMask.is_invalid() { let _ = DeleteObject(ii.hbmMask); }
                 
                 let mut rgba_data = vec![0u8; (width * height * 4) as usize];
                 for i in (0..bgra_data.len()).step_by(4) {

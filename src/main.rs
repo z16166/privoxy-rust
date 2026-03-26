@@ -175,7 +175,7 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to create server: {}", e))?;
 
     // Get application state from server
-    let _state = server.get_state();
+    let state = server.get_state();
 
     // Start CGI web interface if enabled
     #[cfg(feature = "cgi")]

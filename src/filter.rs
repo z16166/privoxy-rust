@@ -663,13 +663,19 @@ impl Default for FilterEngine {
 }
 
 pub fn parse_filter_file(content: &str) -> PrivoxyResult<Vec<Filter>> {
+    let reader = std::io::BufReader::new(content.as_bytes());
+    let lines = crate::util::read_lines(reader);
+    parse_filter_lines(lines)
+}
+
+pub fn parse_filter_lines(lines: Vec<String>) -> PrivoxyResult<Vec<Filter>> {
     let mut filters: Vec<Filter> = Vec::new();
     let mut current_filter: Option<Filter> = None;
     
-    for line in content.lines() {
+    for line in lines {
         let trimmed = line.trim();
         
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        if trimmed.is_empty() {
             continue;
         }
         

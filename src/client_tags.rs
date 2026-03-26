@@ -6,7 +6,7 @@
 //! Tags can be associated with client IP addresses and used for conditional filtering.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+// // use std::sync::Arc;
 use parking_lot::RwLock;
 
 /// A client-specific tag with optional expiration
@@ -100,8 +100,13 @@ impl ClientTagManager {
         let clients = self.clients.read();
         if let Some(client_tags) = clients.get(client_address) {
             client_tags.tags.iter().any(|t| {
-                // Simple pattern matching - can be extended with regex
-                if pattern.ends_with('*') {
+                if pattern.starts_with('*') && pattern.ends_with('*') {
+                    let inner = &pattern[1..pattern.len() - 1];
+                    t.name.contains(inner)
+                } else if pattern.starts_with('*') {
+                    let suffix = &pattern[1..];
+                    t.name.ends_with(suffix)
+                } else if pattern.ends_with('*') {
                     let prefix = &pattern[..pattern.len() - 1];
                     t.name.starts_with(prefix)
                 } else {

@@ -4,12 +4,10 @@
 //! 
 //! This module provides web-based editing of Privoxy actions files.
 
-use std::sync::Arc;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
-use crate::config::Config;
 use crate::error::{PrivoxyError, PrivoxyResult};
 
 /// Line types in an actions file
