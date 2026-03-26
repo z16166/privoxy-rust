@@ -175,7 +175,7 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to create server: {}", e))?;
 
     // Get application state from server
-    let state = server.get_state();
+    let _state = server.get_state();
 
     // Start CGI web interface if enabled
     #[cfg(feature = "cgi")]
@@ -294,7 +294,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn setup_shutdown_handler(config: ConfigRef) -> tokio::sync::oneshot::Receiver<()> {
+fn setup_shutdown_handler(_config: ConfigRef) -> tokio::sync::oneshot::Receiver<()> {
     let (tx, rx) = tokio::sync::oneshot::channel();
 
     tokio::spawn(async move {

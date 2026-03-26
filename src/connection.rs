@@ -1,12 +1,13 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
+use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_socks::tcp::socks5::Socks5Stream;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::action::{
     find_action_for_url, ActionContext,
@@ -26,7 +27,7 @@ use crate::compression::decompress;
 use crate::config::ConfigRef;
 use crate::constants::*;
 use crate::error::{PrivoxyError, PrivoxyResult};
-use crate::filter::{FilterType, FilterVariables};
+use crate::filter::FilterVariables;
 use crate::http::{HttpRequest, HttpResponse, create_connect_response, create_error_response};
 use crate::state::ClientState;
 use regex::Regex;
@@ -125,7 +126,7 @@ impl ConnectionHandler {
                             }
                             Ok(None) => {
                                 // Handle forward . case - direct connection
-                                let mut spec = crate::config::ForwardSpec {
+                                let spec = crate::config::ForwardSpec {
                                     pattern: pattern.clone(),
                                     forward_type: crate::config::ForwardType::Direct,
                                     gateway_host: None,
@@ -195,65 +196,92 @@ impl ConnectionHandler {
         
         debug!("Forwarding decision for {}:{}: {:?}", host, port, forward_spec.forward_type);
         
-        // Step 1: Connect to gateway (SOCKS) if specified
-        let mut stream = if let Some(ref gateway_host) = forward_spec.gateway_host {
-            let gateway_addr = format!("{}:{}", gateway_host, forward_spec.gateway_port);
-            
-            // Determine next hop address for SOCKS tunnel
-            let next_hop = if let Some(ref forward_host) = forward_spec.forward_host {
-                format!("{}:{}", forward_host, forward_spec.forward_port)
-            } else {
-                format!("{}:{}", host, port)
-            };
-
-            debug!("Connecting to SOCKS gateway {} to reach {}", gateway_addr, next_hop);
-            
-            let tcp_stream = TcpStream::connect(&gateway_addr).await
-                .map_err(|e| PrivoxyError::Connection(
-                    format!("Failed to connect to gateway {}: {}", gateway_addr, e)
-                ))?;
-            
-            match forward_spec.forward_type {
-                crate::config::ForwardType::Socks5 | crate::config::ForwardType::Socks5t => {
-                    let socks_stream = Socks5Stream::connect_with_socket(tcp_stream, next_hop.as_str())
-                        .await
-                        .map_err(|e| PrivoxyError::Connection(
-                            format!("SOCKS5 connect failed: {:?}", e)
-                        ))?;
-                    socks_stream.into_inner()
-                }
-                crate::config::ForwardType::Socks4 | crate::config::ForwardType::Socks4a => {
-                    let socks_stream = tokio_socks::tcp::socks4::Socks4Stream::connect_with_socket(
-                        tcp_stream, 
-                        next_hop.as_str()
-                    )
-                        .await
-                        .map_err(|e| PrivoxyError::Connection(
-                            format!("SOCKS4 connect failed: {:?}", e)
-                        ))?;
-                    socks_stream.into_inner()
-                }
-                _ => tcp_stream, // Should not happen for SOCKS types
-            }
-        } else if let Some(ref forward_host) = forward_spec.forward_host {
-            // Direct HTTP proxy connection (no SOCKS)
-            let proxy_addr = format!("{}:{}", forward_host, forward_spec.forward_port);
-            debug!("Connecting to HTTP proxy {} to reach {}:{}", proxy_addr, host, port);
-            TcpStream::connect(&proxy_addr).await
-                .map_err(|e| PrivoxyError::Connection(
-                    format!("Failed to connect to HTTP proxy {}: {}", proxy_addr, e)
-                ))?
-        } else {
-            // Truly direct connection
-            let target_addr = format!("{}:{}", host, port);
-            debug!("Connecting directly to {}", target_addr);
-            TcpStream::connect(&target_addr).await
-                .map_err(|e| PrivoxyError::Connection(
-                    format!("Failed to connect to {}: {}", target_addr, e)
-                ))?
+        let (timeout_secs, retries) = {
+            let config = self.config.read();
+            (config.connection_timeout_secs, config.forwarded_connect_retries)
         };
 
-        Ok((stream, forward_spec))
+        let mut last_error = None;
+        for i in 0..=retries {
+            if i > 0 {
+                debug!("Retrying connection to {}:{} (attempt {}/{})", host, port, i, retries);
+            }
+
+            let forward_spec_clone = forward_spec.clone();
+            let host_clone = host.to_string();
+            let result = timeout(Duration::from_secs(timeout_secs), async move {
+                let host = host_clone.as_str();
+                // Step 1: Connect to gateway (SOCKS) if specified
+                if let Some(ref gateway_host) = forward_spec_clone.gateway_host {
+                    let gateway_addr = format!("{}:{}", gateway_host, forward_spec_clone.gateway_port);
+                    
+                    // Determine next hop address for SOCKS tunnel
+                    let next_hop = if let Some(ref forward_host) = forward_spec_clone.forward_host {
+                        format!("{}:{}", forward_host, forward_spec_clone.forward_port)
+                    } else {
+                        format!("{}:{}", host, port)
+                    };
+
+                    debug!("Connecting to SOCKS gateway {} to reach {}", gateway_addr, next_hop);
+                    
+                    let tcp_stream = TcpStream::connect(&gateway_addr).await
+                        .map_err(|e| PrivoxyError::Connection(
+                            format!("Failed to connect to gateway {}: {}", gateway_addr, e)
+                        ))?;
+                    
+                    match forward_spec_clone.forward_type {
+                        crate::config::ForwardType::Socks5 | crate::config::ForwardType::Socks5t => {
+                            let socks_stream = Socks5Stream::connect_with_socket(tcp_stream, next_hop.as_str())
+                                .await
+                                .map_err(|e| PrivoxyError::Connection(
+                                    format!("SOCKS5 connect failed: {:?}", e)
+                                ))?;
+                            Ok(socks_stream.into_inner())
+                        }
+                        crate::config::ForwardType::Socks4 | crate::config::ForwardType::Socks4a => {
+                            let socks_stream = tokio_socks::tcp::socks4::Socks4Stream::connect_with_socket(
+                                tcp_stream, 
+                                next_hop.as_str()
+                            )
+                                .await
+                                .map_err(|e| PrivoxyError::Connection(
+                                    format!("SOCKS4 connect failed: {:?}", e)
+                                ))?;
+                            Ok(socks_stream.into_inner())
+                        }
+                        _ => Ok(tcp_stream),
+                    }
+                } else if let Some(ref forward_host) = forward_spec_clone.forward_host {
+                    // Direct HTTP proxy connection (no SOCKS)
+                    let proxy_addr = format!("{}:{}", forward_host, forward_spec_clone.forward_port);
+                    debug!("Connecting to HTTP proxy {} to reach {}:{}", proxy_addr, host, port);
+                    TcpStream::connect(&proxy_addr).await
+                        .map_err(|e| PrivoxyError::Connection(
+                            format!("Failed to connect to HTTP proxy {}: {}", proxy_addr, e)
+                        ))
+                } else {
+                    // Truly direct connection
+                    let target_addr = format!("{}:{}", host, port);
+                    debug!("Connecting directly to {}", target_addr);
+                    TcpStream::connect(&target_addr).await
+                        .map_err(|e| PrivoxyError::Connection(
+                            format!("Failed to connect to {}: {}", target_addr, e)
+                        ))
+                }
+            }).await;
+
+            match result {
+                Ok(Ok(stream)) => return Ok((stream, forward_spec)),
+                Ok(Err(e)) => {
+                    last_error = Some(e);
+                }
+                Err(_) => {
+                    last_error = Some(PrivoxyError::Connection(format!("Connection to {}:{} timed out after {}s", host, port, timeout_secs)));
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| PrivoxyError::Connection("Unknown connection error".to_string())))
     }
 
     async fn handle_connect(&mut self, request: HttpRequest) -> PrivoxyResult<()> {
@@ -355,7 +383,7 @@ impl ConnectionHandler {
         let request_bytes = self.build_request_bytes(&request, &forward_spec);
         server_stream.write_all(&request_bytes).await?;
         
-        self.forward_response(&mut server_stream, &url, &mut action_ctx).await
+        self.forward_response(&mut server_stream, &url, &mut action_ctx, action.as_ref()).await
     }
 
     /// Build HTTP request bytes with correct request line format
@@ -403,7 +431,7 @@ impl ConnectionHandler {
         bytes.freeze()
     }
 
-    async fn forward_response(&mut self, server_stream: &mut TcpStream, url: &str, action_ctx: &mut ActionContext) -> PrivoxyResult<()> {
+    async fn forward_response(&mut self, server_stream: &mut TcpStream, url: &str, action_ctx: &mut ActionContext, action: Option<&crate::config::Action>) -> PrivoxyResult<()> {
         let mut buffer = vec![0u8; BUFFER_SIZE];
         let mut response_data = BytesMut::new();
 
@@ -459,12 +487,7 @@ impl ConnectionHandler {
             }
         }
 
-        let action = {
-            let config = self.config.read();
-            find_action_for_url(url, &config)
-        };
-
-        if let Some(ref a) = action {
+        if let Some(a) = action {
             self.apply_action_to_response(a, &mut response, url, action_ctx);
             
             #[cfg(feature = "image-blocking")]
@@ -502,7 +525,6 @@ impl ConnectionHandler {
             }
         }
 
-        self.apply_server_header_filters(&mut response, url);
         self.apply_content_filters(&mut response, url, action_ctx);
 
         self.client_stream.write_all(&response.to_bytes()).await?;

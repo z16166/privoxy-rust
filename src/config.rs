@@ -12,6 +12,8 @@ use tracing::{debug, info, warn};
 use crate::error::{PrivoxyError, PrivoxyResult};
 use crate::constants::*;
 
+use ipnet;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListenAddress {
     pub addr: String,
@@ -246,6 +248,7 @@ pub struct Config {
     pub filter_files: Vec<PathBuf>,
     pub permit_access: Vec<String>,
     pub deny_access: Vec<String>,
+    pub forwarded_connect_retries: u32,
     pub admin_address: Option<String>,
     pub proxy_info_url: Option<String>,
     pub user_manual: Option<String>,
@@ -307,6 +310,7 @@ impl Default for Config {
             filter_files: Vec::new(),
             permit_access: Vec::new(), // Deny all by default, matching C implementation
             deny_access: Vec::new(),
+            forwarded_connect_retries: 0,
             admin_address: None,
             proxy_info_url: Some(HOME_PAGE_URL.to_string()),
             user_manual: None,
@@ -599,13 +603,17 @@ impl Config {
                     "log-file" => {
                         config.log_file = Some(PathBuf::from(value));
                     }
-                    "connection-timeout" => {
+                    "socket-timeout" | "connection-timeout" => {
                         config.connection_timeout_secs = value.parse()
-                            .map_err(|_| PrivoxyError::Config(format!("Invalid connection timeout: {}", value)))?;
+                            .map_err(|_| PrivoxyError::Config(format!("Invalid timeout: {}", value)))?;
                     }
                     "keep-alive-timeout" => {
                         config.keep_alive_timeout_secs = value.parse()
                             .map_err(|_| PrivoxyError::Config(format!("Invalid keep-alive timeout: {}", value)))?;
+                    }
+                    "forwarded-connect-retries" => {
+                        config.forwarded_connect_retries = value.parse()
+                            .map_err(|_| PrivoxyError::Config(format!("Invalid retries: {}", value)))?;
                     }
                     "client-specific-tag" => {
                         // Client-specific tags are handled by client_tags module
@@ -903,24 +911,66 @@ fn parse_debug_level(value: &str) -> PrivoxyResult<u32> {
     Ok(level)
 }
 
-fn matches_pattern(addr: &str, pattern: &str) -> bool {
-    // Simple pattern matching - can be enhanced
-    if pattern == "0.0.0.0/0" || pattern == "*" {
+fn matches_pattern(addr_str: &str, pattern: &str) -> bool {
+    if pattern == "*" || pattern == "0.0.0.0/0" || pattern == "::/0" {
         return true;
     }
 
-    if pattern.contains('/') {
-        // CIDR notation - simplified check
-        let network_part = pattern.split('/').next().unwrap_or(pattern);
-        addr.starts_with(network_part)
-    } else {
-        addr == pattern || pattern == "*"
+    let addr = match addr_str.parse::<std::net::IpAddr>() {
+        Ok(a) => a,
+        Err(_) => return addr_str == pattern, // Fallback to exact string match for hostnames
+    };
+
+    // 1. Try standard CIDR (e.g., 192.168.1.0/24)
+    if let Ok(net) = pattern.parse::<ipnet::IpNet>() {
+        return net.contains(&addr);
     }
+
+    // 2. Handle IP/Mask format (e.g., 192.168.1.0/255.255.255.0)
+    if pattern.contains('/') {
+        let parts: Vec<&str> = pattern.split('/').collect();
+        if parts.len() == 2 {
+            if let (Ok(net_addr), Ok(mask)) = (parts[0].parse::<std::net::IpAddr>(), parts[1].parse::<std::net::IpAddr>()) {
+                match (addr, net_addr, mask) {
+                    (std::net::IpAddr::V4(a), std::net::IpAddr::V4(n), std::net::IpAddr::V4(m)) => {
+                        return (u32::from(a) & u32::from(m)) == (u32::from(n) & u32::from(m));
+                    }
+                    _ => {} // IPv6 masks are usually CIDR only
+                }
+            }
+        }
+    }
+
+    // 3. Fallback to exact match or hostname match
+    addr_str == pattern
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_matches_pattern() {
+        // Exact IP
+        assert!(matches_pattern("127.0.0.1", "127.0.0.1"));
+        assert!(!matches_pattern("127.0.0.1", "127.0.0.2"));
+        
+        // Wildcard
+        assert!(matches_pattern("192.168.1.1", "*"));
+        assert!(matches_pattern("192.168.1.1", "0.0.0.0/0"));
+        
+        // CIDR
+        assert!(matches_pattern("192.168.1.5", "192.168.1.0/24"));
+        assert!(!matches_pattern("192.168.2.5", "192.168.1.0/24"));
+        
+        // IP/Mask
+        assert!(matches_pattern("192.168.1.5", "192.168.1.0/255.255.255.0"));
+        assert!(!matches_pattern("192.168.2.5", "192.168.1.0/255.255.255.0"));
+        
+        // Hostname fallback
+        assert!(matches_pattern("localhost", "localhost"));
+        assert!(!matches_pattern("example.com", "localhost"));
+    }
 
     #[test]
     fn test_default_config() {

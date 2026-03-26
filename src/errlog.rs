@@ -257,7 +257,7 @@ pub fn init_error_log(prog_name: &str, logfname: &str) -> Result<(), String> {
     
     log_error(LOG_LEVEL_INFO, &format!("Opening logfile '{}'", logfname));
     
-    let file = OpenOptions::new()
+    let _file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(logfname)

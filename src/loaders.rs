@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::config::{Action, ForwardSpec, ForwardType, UrlAction};
 use crate::error::{PrivoxyError, PrivoxyResult};
@@ -613,8 +613,8 @@ mod tests {
         let spec = parse_forward_directive(line).unwrap().unwrap();
         
         assert_eq!(spec.pattern, "/");
-        assert_eq!(spec.proxy_host, "127.0.0.1");
-        assert_eq!(spec.proxy_port, 1080);
+        assert_eq!(spec.gateway_host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(spec.gateway_port, 1080);
         assert_eq!(spec.forward_type, ForwardType::Socks5);
     }
 
