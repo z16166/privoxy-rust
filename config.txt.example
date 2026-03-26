@@ -1,0 +1,157 @@
+# Privoxy Configuration File Example
+# This is a sample configuration file for the Rust implementation of Privoxy
+
+#==============================================================================
+# 1. LISTENING ADDRESS
+#==============================================================================
+
+# Listen on localhost port 8118 (default)
+listen-address 127.0.0.1:8118
+
+# You can specify multiple addresses:
+# listen-address 127.0.0.1:8118 192.168.1.1:8118
+
+#==============================================================================
+# 2. LOG FILE
+#==============================================================================
+
+# Log file location (comment out to log to stderr)
+# logfile privoxy.log
+
+#==============================================================================
+# 3. DEBUG LEVEL
+#==============================================================================
+
+# Debug level - can be a combination of:
+#  1 = LOG_LEVEL_REQUEST    (show each request)
+#  2 = LOG_LEVEL_CONNECT    (show each connection)
+#  4 = LOG_LEVEL_TAGGING    (show tagging)
+#  8 = LOG_LEVEL_HEADER     (show header processing)
+# 16 = LOG_LEVEL_WRITING    (show data writing)
+# 4096 = LOG_LEVEL_INFO     (informational messages)
+# 8192 = LOG_LEVEL_ERROR    (error messages)
+#
+# Default is 12288 (LOG_LEVEL_INFO | LOG_LEVEL_ERROR)
+debug 12288
+
+#==============================================================================
+# 4. ACTIONS FILES
+#==============================================================================
+
+# Actions files define what to do with requests
+actionsfile default.action
+# actionsfile user.action
+
+#==============================================================================
+# 5. FILTER FILES
+#==============================================================================
+
+# Filter files define content filters
+filterfile default.filter
+# filterfile user.filter
+
+#==============================================================================
+# 6. TRUST FILES
+#==============================================================================
+
+# Trust files define trusted referrers
+# trustfile default.trust
+
+#==============================================================================
+# 7. ACCESS CONTROL
+#==============================================================================
+
+# Permit access from these addresses
+permit-access 127.0.0.1
+# permit-access 192.168.0.0/16
+# permit-access 10.0.0.0/8
+
+# Deny access from these addresses (checked before permit-access)
+# deny-access 192.168.1.100
+
+#==============================================================================
+# 8. FORWARDING
+#==============================================================================
+
+# Forward requests to another proxy
+# forward / 127.0.0.1:8080
+# forward .example.com 127.0.0.1:8080
+
+# Forward to SOCKS proxy
+# forward-socks5 / 127.0.0.1:1080 .
+# forward-socks4 / 127.0.0.1:1080 .
+
+#==============================================================================
+# 9. TOGGLE
+#==============================================================================
+
+# Initial toggle state (1 = enabled, 0 = disabled)
+toggle 1
+
+# Allow remote toggling via CGI
+enable-remote-toggle 1
+
+# Allow remote editing of actions
+enable-edit-actions 1
+
+#==============================================================================
+# 10. BUFFER LIMITS
+#==============================================================================
+
+# Maximum size for content filtering buffer (in KB)
+# buffer-limit 4096
+
+#==============================================================================
+# 11. CONNECTION SETTINGS
+#==============================================================================
+
+# Maximum number of client connections
+# max-client-connections 1000
+
+# Connection timeout in seconds
+# connection-timeout 300
+
+# Keep-alive timeout in seconds
+# keep-alive-timeout 55
+
+#==============================================================================
+# 12. ADMINISTRATIVE
+#==============================================================================
+
+# Admin email address (shown in error pages)
+# admin-address admin@example.com
+
+# Proxy info URL (shown in error pages)
+# proxy-info-url https://www.privoxy.org/
+
+#==============================================================================
+# 13. FEATURE FLAGS
+#==============================================================================
+
+# Enable/disable features
+# enable-acls 1
+# enable-cgi-edit-actions 1
+# enable-fast-redirects 1
+# enable-force-load 1
+# enable-image-blocking 1
+# enable-connection-keep-alive 1
+# enable-connection-sharing 1
+# enable-client-tags 1
+# enable-statistics 1
+
+#==============================================================================
+# 14. COMPRESSION
+#==============================================================================
+
+# Enable compression (requires FEATURE_COMPRESSION)
+# enable-compression 1
+
+# Compression level (1-9)
+# compression-level 6
+
+#==============================================================================
+# 15. HTTPS INSPECTION
+#==============================================================================
+
+# Enable HTTPS inspection (requires FEATURE_HTTPS_INSPECTION)
+# enable-https-inspection 0
