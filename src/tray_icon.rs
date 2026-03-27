@@ -62,6 +62,8 @@ pub struct TrayIconApp {
     icon_manager: Option<IconManager>,
     current_frame: usize,
     tray_icon: Option<tray_icon::TrayIcon>,
+    #[cfg(feature = "tray-icon")]
+    menu: Option<TrayMenu>,
     pub ui_handles: Option<logger::UiLogHandles>,
     pub clear_log_item_libui: Option<SendMenuItem>,
 }
@@ -127,6 +129,8 @@ impl TrayIconApp {
             icon_manager,
             current_frame: 0,
             tray_icon: None,
+            #[cfg(feature = "tray-icon")]
+            menu: None,
             ui_handles: None,
             clear_log_item_libui: None,
         }
@@ -456,6 +460,9 @@ impl TrayIconApp {
             &menu_item_toggle,
         ]).map_err(|e| PrivoxyError::Other(format!("Menu error: {}", e)))?;
 
+        // Store menu for dynamic attachment
+        self.menu = Some(menu.clone());
+
         // Load icon from embedded resource or file
         let icon = load_icon().map_err(|e| PrivoxyError::Other(format!("Failed to load icon: {}", e)))?;
 
@@ -484,13 +491,10 @@ impl TrayIconApp {
         // Clone config for use in the event loop
         let config = self.config.clone();
 
-        // Create tray icon before starting event loop
-        // On Windows and Linux, this is fine to do before the event loop starts
-        // On macOS, we need to create it after the event loop is running
+        // Create tray icon WITHOUT initial menu
         #[cfg(not(target_os = "macos"))]
         {
             let tray_icon = TrayIconBuilder::new()
-                .with_menu(Box::new(menu.clone()))
                 .with_tooltip("Privoxy - Web Proxy")
                 .with_icon(icon.clone())
                 .build();
@@ -559,11 +563,24 @@ impl TrayIconApp {
                 std::process::exit(0);
             }
             
-            // Check for tray icon events (e.g. left click to show window)
+            // Check for tray icon events
             if let Ok(tray_event) = TrayIconEvent::receiver().try_recv() {
-                if let TrayIconEvent::Click { button: MouseButton::Left, .. } = tray_event {
-                    info!("Tray icon left clicked - showing window");
-                    self.show_window();
+                match tray_event {
+                    TrayIconEvent::Click { button: MouseButton::Left, .. } => {
+                        info!("Tray icon left clicked - showing window");
+                        // Ensure menu is not attached during left click
+                        if let Some(icon) = &self.tray_icon {
+                            icon.set_menu(None);
+                        }
+                        self.show_window();
+                    }
+                    TrayIconEvent::Click { button: MouseButton::Right, .. } => {
+                        info!("Tray icon right clicked - attaching menu");
+                        if let (Some(icon), Some(menu)) = (&self.tray_icon, &self.menu) {
+                            icon.set_menu(Some(Box::new(menu.clone())));
+                        }
+                    }
+                    _ => {}
                 }
             }
             
