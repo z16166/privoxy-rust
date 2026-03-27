@@ -312,7 +312,6 @@ impl TrayIconApp {
             let mut about_close_btn = Button::new("Close");
             let mut about_window_close = about_window.clone();
             about_close_btn.on_clicked(move |_| {
-                about_window_close.hide();
                 #[cfg(windows)]
                 unsafe {
                     use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow};
@@ -323,13 +322,13 @@ impl TrayIconApp {
                         let _ = SetForegroundWindow(main_hwnd);
                     }
                 }
+                about_window_close.hide();
             });
             about_vbox.append(about_close_btn, LayoutStrategy::Compact);
             about_window.set_child(about_vbox);
             
             let mut about_window_on_closing = about_window.clone();
             about_window.on_closing(&ui, move |_| {
-                about_window_on_closing.hide();
                 #[cfg(windows)]
                 unsafe {
                     use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow};
@@ -340,6 +339,7 @@ impl TrayIconApp {
                         let _ = SetForegroundWindow(main_hwnd);
                     }
                 }
+                about_window_on_closing.hide();
             });
 
             let mut about_window_handler = about_window.clone();
