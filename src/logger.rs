@@ -11,11 +11,21 @@ use crate::error::PrivoxyResult;
 /// Global flag to track if logging has been initialized
 static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(feature = "tray-icon")]
+use once_cell::sync::Lazy;
+#[cfg(feature = "tray-icon")]
+use parking_lot::RwLock;
+
+/// Global registry for the GUI log cache to allow late-binding
+#[cfg(feature = "tray-icon")]
+static GUI_LOG_CACHE_REGISTRY: Lazy<RwLock<Option<LogCache>>> = Lazy::new(|| RwLock::new(None));
+
 /// UI handle and log textarea handle for real-time updates
 #[cfg(feature = "tray-icon")]
 #[derive(Clone)]
 pub struct UiLogHandles {
     pub ui: libui::UI,
+    pub window: libui::controls::Window,
     pub log_textarea: libui::controls::MultilineEntry,
 }
 
@@ -54,7 +64,13 @@ where
     }
 
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
-        if let Some(ref log_cache) = self.log_cache {
+        // Use either the provided cache or the global registry
+        #[cfg(feature = "tray-icon")]
+        let log_cache_opt = self.log_cache.clone().or_else(|| GUI_LOG_CACHE_REGISTRY.read().clone());
+        #[cfg(not(feature = "tray-icon"))]
+        let log_cache_opt = self.log_cache.clone();
+
+        if let Some(ref log_cache) = log_cache_opt {
             let mut visitor = StringVisitor::new();
             event.record(&mut visitor);
             
@@ -66,7 +82,9 @@ where
                 Level::TRACE => "TRACE",
             };
             
-            let message = format!("{}: {}", level, visitor.string);
+            let now = chrono::Local::now();
+            let timestamp = now.format("%Y-%m-%dT%H:%M:%S%.3f%:z");
+            let message = format!("{} {}: {}", timestamp, level, visitor.string);
             
             if let Ok(mut cache) = log_cache.lock() {
                 #[cfg(feature = "tray-icon")]
@@ -130,6 +148,18 @@ impl<'a> tracing::field::Visit for StringVisitor {
     }
 }
 
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::time::FormatTime;
+
+struct LocalTimer;
+
+impl FormatTime for LocalTimer {
+    fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
+        let now = chrono::Local::now();
+        write!(w, "{}", now.format("%Y-%m-%dT%H:%M:%S%.6f%:z"))
+    }
+}
+
 pub fn init_logging(level: &str) -> PrivoxyResult<()> {
     // Check if logging has already been initialized
     if LOGGING_INITIALIZED.load(Ordering::Relaxed) {
@@ -137,6 +167,9 @@ pub fn init_logging(level: &str) -> PrivoxyResult<()> {
     }
     
     errlog::init_log_module();
+    
+    // Enable ANSI support on Windows if needed
+    crate::util::enable_ansi_support();
     
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(level));
@@ -146,8 +179,9 @@ pub fn init_logging(level: &str) -> PrivoxyResult<()> {
         .with_target(false)
         .with_thread_ids(false)
         .with_thread_names(false)
-        .with_ansi(false)
+        .with_ansi(true)
         .with_level(true)
+        .with_timer(LocalTimer)
         .with_filter(env_filter);
 
     tracing_subscriber::registry()
@@ -159,6 +193,12 @@ pub fn init_logging(level: &str) -> PrivoxyResult<()> {
     Ok(())
 }
 
+/// Register a GUI log cache with the global registry for late-binding
+#[cfg(feature = "tray-icon")]
+pub fn register_gui_cache(log_cache: LogCache) {
+    *GUI_LOG_CACHE_REGISTRY.write() = Some(log_cache);
+}
+
 pub fn init_logging_with_gui(level: &str, log_cache: Option<LogCache>, max_buffer_lines: usize) -> PrivoxyResult<()> {
     // Check if logging has already been initialized
     if LOGGING_INITIALIZED.load(Ordering::Relaxed) {
@@ -166,6 +206,9 @@ pub fn init_logging_with_gui(level: &str, log_cache: Option<LogCache>, max_buffe
     }
     
     errlog::init_log_module();
+    
+    // Enable ANSI support on Windows if needed
+    crate::util::enable_ansi_support();
     
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(level));
@@ -175,8 +218,9 @@ pub fn init_logging_with_gui(level: &str, log_cache: Option<LogCache>, max_buffe
         .with_target(false)
         .with_thread_ids(false)
         .with_thread_names(false)
-        .with_ansi(false)
+        .with_ansi(true)
         .with_level(true)
+        .with_timer(LocalTimer)
         .with_filter(env_filter);
 
     let gui_layer = GuiLogLayer::new(log_cache, max_buffer_lines);

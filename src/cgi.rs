@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -125,9 +125,23 @@ impl CgiHandler {
         symbols.insert("time".to_string(), now.format("%Y-%m-%d %H:%M:%S").to_string());
         
         // Actions and filter filenames (from C code)
-        symbols.insert("actions-filenames".to_string(), String::new());
-        symbols.insert("re-filter-filenames".to_string(), String::new());
-        symbols.insert("trust-filename".to_string(), String::new());
+        let actions_filenames = self.config.actions_files.iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("<br>");
+        symbols.insert("actions-filenames".to_string(), actions_filenames);
+
+        let filter_filenames = self.config.filter_files.iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("<br>");
+        symbols.insert("re-filter-filenames".to_string(), filter_filenames);
+
+        let trust_filenames = self.config.trust_files.iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("<br>");
+        symbols.insert("trust-filename".to_string(), trust_filenames);
         
         // Forward/gateway info (from C code)
         symbols.insert("forward-host".to_string(), String::new());
@@ -169,11 +183,17 @@ impl CgiHandler {
         }
         
         // Admin address and proxy info conditionals
+        // In Privoxy, map_block_killer(symbols, "name") means:
+        // if condition is TRUE, keep the block (by NOT inserting "name")
+        // if condition is FALSE, kill the block (by inserting "name" -> "")
         if self.config.admin_address.is_none() {
             symbols.insert("have-adminaddr-info".to_string(), String::new());
         }
         if self.config.proxy_info_url.is_none() {
             symbols.insert("have-proxy-info".to_string(), String::new());
+        }
+        if self.config.user_manual.is_none() {
+            symbols.insert("have-help-info".to_string(), String::new());
         }
         
         symbols
@@ -259,23 +279,23 @@ impl CgiHandler {
         let mut result = template.to_string();
         
         // Remove @if-...-then@ markers
-        let if_then_pattern = regex::Regex::new(r"@if-[^-]+-then@").unwrap();
+        let if_then_pattern = regex::Regex::new(r"@if-.+?-then@").unwrap();
         result = if_then_pattern.replace_all(&result, "").to_string();
         
         // Remove @else-not-...@ markers
-        let else_not_pattern = regex::Regex::new(r"@else-not-[^-]+@").unwrap();
+        let else_not_pattern = regex::Regex::new(r"@else-not-.+?@").unwrap();
         result = else_not_pattern.replace_all(&result, "").to_string();
         
         // Remove @endif-...@ markers
-        let endif_pattern = regex::Regex::new(r"@endif-[^-]+@").unwrap();
+        let endif_pattern = regex::Regex::new(r"@endif-.+?@").unwrap();
         result = endif_pattern.replace_all(&result, "").to_string();
         
         // Remove @if-...-start@ markers
-        let if_start_pattern = regex::Regex::new(r"@if-[^-]+-start@").unwrap();
+        let if_start_pattern = regex::Regex::new(r"@if-.+?-start@").unwrap();
         result = if_start_pattern.replace_all(&result, "").to_string();
         
         // Remove @if-...-end@ markers
-        let if_end_pattern = regex::Regex::new(r"@if-[^-]+-end@").unwrap();
+        let if_end_pattern = regex::Regex::new(r"@if-.+?-end@").unwrap();
         result = if_end_pattern.replace_all(&result, "").to_string();
         
         result
@@ -290,40 +310,50 @@ impl CgiHandler {
             changed = false;
             
             // Find @if-xxx-then@
-            if let Some(if_start) = result.find("@if-") {
-                if let Some(then_pos) = result[if_start..].find("-then@") {
-                    let then_abs_pos = if_start + then_pos;
-                    let cond_start = if_start + 4; // Skip "@if-"
-                    let condition_name = &result[cond_start..then_abs_pos];
+            // Use a regex to find the start tag correctly even if there are multiple @if- tags
+            let if_pattern = regex::Regex::new(r"@if-(.+?)-then@").unwrap();
+            if let Some(caps) = if_pattern.captures(&result) {
+                let full_match = caps.get(0).unwrap();
+                let if_start = full_match.start();
+                let then_abs_pos = full_match.end() - 6; // Pos of "-then@"
+                let condition_name = caps.get(1).unwrap().as_str();
+                
+                // Find corresponding @else-not-xxx@ and @endif-xxx@
+                let else_marker = format!("@else-not-{}@", condition_name);
+                let endif_marker = format!("@endif-{}@", condition_name);
+                
+                if let Some(else_pos) = result[then_abs_pos + 6..].find(&else_marker) {
+                    let else_abs = then_abs_pos + 6 + else_pos;
                     
-                    // Find corresponding @else-not-xxx@ and @endif-xxx@
-                    let else_marker = format!("@else-not-{}@", condition_name);
-                    let endif_marker = format!("@endif-{}@", condition_name);
-                    
-                    if let Some(else_pos) = result[then_abs_pos + 6..].find(&else_marker) {
-                        let else_abs = then_abs_pos + 6 + else_pos;
+                    if let Some(endif_pos) = result[else_abs + else_marker.len()..].find(&endif_marker) {
+                        let endif_abs = else_abs + else_marker.len() + endif_pos;
                         
-                        if let Some(endif_pos) = result[else_abs + else_marker.len()..].find(&endif_marker) {
-                            let endif_abs = else_abs + else_marker.len() + endif_pos;
-                            
-                            // Extract true and false parts
-                            let true_start = then_abs_pos + 6;
-                            let false_start = else_abs + else_marker.len();
-                            
-                            let true_text = result[true_start..else_abs].to_string();
-                            let false_text = result[false_start..endif_abs].to_string();
-                            
-                            // Check condition
-                            let condition_true = symbols.contains_key(condition_name)
-                                && !symbols.get(condition_name).map(|v| v.is_empty()).unwrap_or(true);
-                            
-                            // Replace entire conditional with appropriate text
-                            let replacement = if condition_true { &true_text } else { &false_text };
-                            result.replace_range(if_start..endif_abs + endif_marker.len(), replacement);
-                            changed = true;
-                        }
+                        // Extract true and false parts
+                        let true_start = then_abs_pos + 6;
+                        let false_start = else_abs + else_marker.len();
+                        
+                        let true_text = result[true_start..else_abs].to_string();
+                        let false_text = result[false_start..endif_abs].to_string();
+                        
+                        // Check condition
+                        let condition_true = symbols.contains_key(condition_name)
+                            && !symbols.get(condition_name).map(|v| v.is_empty()).unwrap_or(true);
+                        
+                        // Replace entire conditional with appropriate text
+                        let replacement = if condition_true { &true_text } else { &false_text };
+                        result.replace_range(if_start..endif_abs + endif_marker.len(), replacement);
+                        changed = true;
+                    } else {
+                        // Could not find endif, skip this tag for now to avoid infinite loop
+                        // This might happen if tags are malformed
+                        break;
                     }
+                } else {
+                    // Could not find else, skip this tag
+                    break;
                 }
+            } else {
+                break;
             }
         }
         
@@ -339,35 +369,38 @@ impl CgiHandler {
             changed = false;
             
             // Find @if-xxxstart@
-            if let Some(if_start) = result.find("@if-") {
-                if let Some(start_pos) = result[if_start..].find("start@") {
-                    let start_abs = if_start + start_pos;
-                    let cond_start = if_start + 4; // Skip "@if-"
-                    let cond_end = start_abs;
-                    let condition_name = &result[cond_start..cond_end];
+            let if_start_pattern = regex::Regex::new(r"@if-(.+?)start@").unwrap();
+            if let Some(caps) = if_start_pattern.captures(&result) {
+                let full_match = caps.get(0).unwrap();
+                let if_start = full_match.start();
+                let start_abs = full_match.end() - 6; // Pos of "start@"
+                let condition_name = caps.get(1).unwrap().as_str();
+                
+                // Find corresponding @if-xxx-end@
+                let end_marker = format!("@if-{}-end@", condition_name);
+                
+                if let Some(end_pos) = result[start_abs + 6..].find(&end_marker) {
+                    let end_abs = start_abs + 6 + end_pos;
                     
-                    // Find corresponding @if-xxx-end@
-                    let end_marker = format!("@if-{}-end@", condition_name);
+                    // Check condition
+                    let should_show = symbols.contains_key(condition_name)
+                        && !symbols.get(condition_name).map(|v| v.is_empty()).unwrap_or(true);
                     
-                    if let Some(end_pos) = result[start_abs + 6..].find(&end_marker) {
-                        let end_abs = start_abs + 6 + end_pos;
-                        
-                        // Check condition
-                        let should_show = symbols.contains_key(condition_name)
-                            && !symbols.get(condition_name).map(|v| v.is_empty()).unwrap_or(true);
-                        
-                        if should_show {
-                            // Remove markers but keep content
-                            let content_start = start_abs + 6;
-                            let content = &result[content_start..end_abs].to_string();
-                            result.replace_range(if_start..end_abs + end_marker.len(), content);
-                        } else {
-                            // Remove entire block
-                            result.replace_range(if_start..end_abs + end_marker.len(), "");
-                        }
-                        changed = true;
+                    if should_show {
+                        // Remove markers but keep content
+                        let content_start = start_abs + 6;
+                        let content = &result[content_start..end_abs].to_string();
+                        result.replace_range(if_start..end_abs + end_marker.len(), content);
+                    } else {
+                        // Remove entire block
+                        result.replace_range(if_start..end_abs + end_marker.len(), "");
                     }
+                    changed = true;
+                } else {
+                    break;
                 }
+            } else {
+                break;
             }
         }
         
@@ -434,19 +467,52 @@ impl CgiHandler {
         false
     }
 
+    /// Parse query string from URL
+    fn parse_query_string<'a>(&self, query: &'a str) -> HashMap<&'a str, String> {
+        let mut params = HashMap::new();
+        for part in query.split('&') {
+            if let Some((k, v)) = part.split_once('=') {
+                let decoded_v = crate::encode::url_decode(v).unwrap_or_else(|_| v.to_string());
+                params.insert(k, decoded_v);
+            } else {
+                params.insert(part, String::new());
+            }
+        }
+        params
+    }
+
     pub async fn handle_request(&self, req: HyperRequest<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
-        let path = req.uri().path();
+        let path = req.uri().path().to_string();
         let method = req.method().clone();
         
         // Handle POST requests for edit-actions
         #[cfg(feature = "cgi-edit-actions")]
-        if method == hyper::Method::POST && path == "/eas" {
+        if method == hyper::Method::POST && (path == "/eas" || path == "/edit-actions-submit") {
+            if !self.referrer_is_safe(&req) {
+                 let html = self.generate_error_referer(&req);
+                 return Ok(Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header("Content-Type", "text/html; charset=utf-8")
+                    .body(Full::new(Bytes::from(html)))
+                    .unwrap());
+            }
+            
             // Read POST body
             let (_, body) = req.into_parts();
-            let body_bytes = body.collect().await?.to_bytes();
+            let body_bytes = match body.collect().await {
+                Ok(b) => b.to_bytes(),
+                Err(_) => return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Full::new(Bytes::from("Failed to read body")))
+                    .unwrap()),
+            };
             let params = self.parse_post_body(&body_bytes);
             
-            let html = self.handle_edit_actions_submit(&params);
+            let html = if path == "/edit-actions-submit" {
+                self.handle_edit_actions_submit(&params)
+            } else {
+                self.handle_edit_actions_for_url_submit(&params)
+            };
             
             return Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -455,14 +521,17 @@ impl CgiHandler {
                 .unwrap());
         }
         
-        // Route requests based on path (matching C version CGI endpoints)
-        // Follow feature flags to match C version behavior
-        let html = match path {
+        // Route requests based on path
+        let html = match path.as_str() {
             // Main pages - always available
             "/" | "/index.html" => self.generate_main_page(),
             "/show-status" | "/status" => self.generate_status_page(),
-            "/show-request" => self.generate_show_request(),
-            "/show-url-info" => self.generate_show_url_info(),
+            "/show-request" => self.generate_show_request(&req),
+            "/show-url-info" => self.generate_show_url_info(&req),
+            
+            // Binary responses
+            "/favicon.ico" => return self.send_favicon(),
+            "/send-banner" => return self.send_banner(&req),
             
             // Client tags - only if FEATURE_CLIENT_TAGS is enabled
             #[cfg(feature = "client-tags")]
@@ -519,6 +588,42 @@ impl CgiHandler {
                 }
             },
             #[cfg(feature = "cgi-edit-actions")]
+            "/edit-action-line" => {
+                if !self.config.enable_edit_actions {
+                    self.generate_error_disabled("editing actions")
+                } else if !self.referrer_is_safe(&req) {
+                    self.generate_error_referer(&req)
+                } else {
+                    self.generate_edit_action_line(&req)
+                }
+            },
+            #[cfg(feature = "cgi-edit-actions")]
+            "/delete-action-line" => {
+                if !self.config.enable_edit_actions {
+                    self.generate_error_disabled("editing actions")
+                } else if !self.referrer_is_safe(&req) {
+                    self.generate_error_referer(&req)
+                } else {
+                    self.generate_delete_action_line(&req)
+                }
+            },
+            #[cfg(feature = "cgi-edit-actions")]
+            "/add-url-pattern" => {
+                if !self.config.enable_edit_actions {
+                    self.generate_error_disabled("editing actions")
+                } else if !self.referrer_is_safe(&req) {
+                    self.generate_error_referer(&req)
+                } else {
+                    self.generate_add_url_form(&req)
+                }
+            },
+            #[cfg(feature = "cgi-edit-actions")]
+            "/edit-actions-submit" => {
+                // This is now handled as a POST in handle_request, 
+                // but we keep this for GET or error handling
+                self.generate_simple_page("Error", "This endpoint requires a POST request")
+            },
+            #[cfg(feature = "cgi-edit-actions")]
             "/edit-actions-for-url" | "/eafu" => {
                 if !self.config.enable_edit_actions {
                     self.generate_error_disabled("editing actions")
@@ -529,13 +634,13 @@ impl CgiHandler {
                 }
             },
             #[cfg(feature = "cgi-edit-actions")]
-            "/eaa" => {
+            "/eaa" | "/add-url-pattern" => {
                 if !self.config.enable_edit_actions {
                     self.generate_error_disabled("editing actions")
                 } else if !self.referrer_is_safe(&req) {
                     self.generate_error_referer(&req)
                 } else {
-                    self.generate_add_url_form()
+                    self.generate_add_url_form(&req)
                 }
             },
             #[cfg(feature = "cgi-edit-actions")]
@@ -559,33 +664,13 @@ impl CgiHandler {
                 }
             },
             #[cfg(feature = "cgi-edit-actions")]
-            "eal" => {
-                if !self.config.enable_edit_actions {
-                    self.generate_error_disabled("editing actions")
-                } else if !self.referrer_is_safe(&req) {
-                    self.generate_error_referer(&req)
-                } else {
-                    self.generate_edit_actions_list()
-                }
-            },
-            #[cfg(feature = "cgi-edit-actions")]
-            "/eas" => {
-                if !self.config.enable_edit_actions {
-                    self.generate_error_disabled("editing actions")
-                } else if !self.referrer_is_safe(&req) {
-                    self.generate_error_referer(&req)
-                } else {
-                    self.generate_submit_changes()
-                }
-            },
-            #[cfg(feature = "cgi-edit-actions")]
             "/easa" => {
                 if !self.config.enable_edit_actions {
                     self.generate_error_disabled("editing actions")
                 } else if !self.referrer_is_safe(&req) {
                     self.generate_error_referer(&req)
                 } else {
-                    self.generate_add_section_form()
+                    self.generate_add_section_form(&req)
                 }
             },
             #[cfg(feature = "cgi-edit-actions")]
@@ -595,7 +680,7 @@ impl CgiHandler {
                 } else if !self.referrer_is_safe(&req) {
                     self.generate_error_referer(&req)
                 } else {
-                    self.generate_remove_section_form()
+                    self.generate_remove_section_form(&req)
                 }
             },
             #[cfg(feature = "cgi-edit-actions")]
@@ -605,7 +690,19 @@ impl CgiHandler {
                 } else if !self.referrer_is_safe(&req) {
                     self.generate_error_referer(&req)
                 } else {
-                    self.generate_swap_sections_form()
+                    let query = req.uri().query().unwrap_or_default();
+                    let params = self.parse_query_string(query);
+                    if let (Some(f), Some(s1), Some(s2)) = (params.get("file"), params.get("section1"), params.get("section2")) {
+                        // Direct swap via GET (used for Move Up/Down links)
+                        let mut params_map = HashMap::new();
+                        params_map.insert("file".to_string(), f.to_string());
+                        params_map.insert("action".to_string(), "swap_sections".to_string());
+                        params_map.insert("section1".to_string(), s1.to_string());
+                        params_map.insert("section2".to_string(), s2.to_string());
+                        self.handle_edit_actions_for_url_submit(&params_map)
+                    } else {
+                        self.generate_swap_sections_form(&req)
+                    }
                 }
             },
             
@@ -632,11 +729,8 @@ impl CgiHandler {
             },
             
             // Static resources - always available
-            "/error-favicon.ico" => return self.send_file("error-favicon.ico", "image/x-icon"),
-            "/favicon.ico" => return self.send_file("default-favicon.ico", "image/x-icon"),
             "/robots.txt" => return self.send_file("robots.txt", "text/plain"),
             "/send-stylesheet" | "/style.css" => return self.send_file("cgi-style.css", "text/css"),
-            "/send-banner" => return self.send_banner(),
             "/t" => return self.send_transparent_image(),
             "/url-info-osd.xml" => return self.send_file("url-info-osd.xml", "application/opensearchdescription+xml"),
             "/user-manual" => self.generate_user_manual(),
@@ -793,21 +887,19 @@ impl CgiHandler {
     <ul>
 "#));
         
-        // List available actions files
-        let actions_files = [
-            ("default.action", "Default Actions"),
-            ("user.action", "User Actions"),
-        ];
-        
-        for (filename, description) in &actions_files {
-            let path = std::path::Path::new(filename);
+        // List available actions files from config
+        for (i, path) in self.config.actions_files.iter().enumerate() {
+            let filename = path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
+            
             if path.exists() {
-                let encoded_filename = encode::url_encode(filename);
-                let _ = write!(html, r#"        <li><a href="/edit-actions-file?file={}">{}</a> - {}</li>"#, 
-                    encoded_filename, filename, description);
+                let encoded_path = encode::url_encode(&path.to_string_lossy());
+                let _ = write!(html, r#"        <li><a href="/edit-actions-file?file={}&f={}">{}</a></li>"#, 
+                    encoded_path, i, filename);
             } else {
-                let _ = write!(html, r#"        <li><span style="color: gray;">{} (not found)</span> - {}</li>"#, 
-                    filename, description);
+                let _ = write!(html, r#"        <li><span style="color: gray;">{} (not found)</span></li>"#, 
+                    filename);
             }
         }
         
@@ -896,29 +988,388 @@ impl CgiHandler {
                 &line.unprocessed
             };
             
-            let _ = write!(html, r#"        <tr>
+            let _ = match line.line_type {
+                crate::cgiedit::LineType::Action => {
+                    let prev_section = if i > 0 {
+                        file.lines[..i].iter().enumerate().rev().find(|(_, l)| l.line_type == crate::cgiedit::LineType::Action).map(|(idx, _)| idx)
+                    } else { None };
+                    let next_section = file.lines[i+1..].iter().enumerate().find(|(_, l)| l.line_type == crate::cgiedit::LineType::Action).map(|(idx, _)| i + 1 + idx);
+                    
+                    let mut links = format!(r#"<a href="/edit-action-line?file={}&line={}">Edit Actions</a> | 
+                <a href="/eaa?file={}&line={}">Add URL</a> | "#, filename, i, filename, i);
+                    
+                    if let Some(prev) = prev_section {
+                        let _ = write!(links, r#"<a href="/eass?file={}&section1={}&section2={}">Move Up</a> | "#, filename, prev, i);
+                    }
+                    if let Some(next) = next_section {
+                        let _ = write!(links, r#"<a href="/eass?file={}&section1={}&section2={}">Move Down</a> | "#, filename, i, next);
+                    }
+
+                    write!(html, r#"        <tr>
+            <td><b>{}</b></td>
+            <td><code>{{{}}}</code></td>
+            <td>
+                {}
+                <a href="/delete-action-line?file={}&line={}" onclick="return confirm('Delete this entire section?')">Delete Section</a>
+            </td>
+        </tr>
+"#, line_type_str, content, links, filename, i)
+                }
+                crate::cgiedit::LineType::Url => {
+                    write!(html, r#"        <tr>
+            <td>{}</td>
+            <td><code>{}</code></td>
+            <td>
+                <a href="/eau?file={}&line={}&pattern={}">Edit URL</a> |
+                <a href="/ear?file={}&line={}&pattern={}">Remove URL</a>
+            </td>
+        </tr>
+"#, line_type_str, encode::html_encode(content), filename, i, encode::url_encode(content), filename, i, encode::url_encode(content))
+                }
+                _ => {
+                    write!(html, r#"        <tr>
             <td>{}</td>
             <td>{}</td>
             <td>
-                <a href="/edit-action-line?file={}&line={}">Edit</a> |
-                <a href="/delete-action-line?file={}&line={}">Delete</a>
+                <a href="/delete-action-line?file={}&line={}" onclick="return confirm('Delete this line?')">Delete</a>
             </td>
         </tr>
-"#, line_type_str, content, filename, i, filename, i);
+"#, line_type_str, encode::html_encode(content), filename, i)
+                }
+            };
         }
         
         html.push_str(&format!(r#"    </table>
     <p>
         <button type="submit">Save Changes</button>
+        <a href="/easa?file={}&line={}">Add Section</a> |
         <a href="/edit-actions-list">Cancel</a>
     </p>
     </form>
     <p><small>File version: {}</small></p>
 </body>
-</html>"#, file.version));
+</html>"#, filename, file.lines.len(), file.version));
         
         html
     }
+
+    #[cfg(feature = "cgi-edit-actions")]
+    fn generate_edit_action_line(&self, req: &HyperRequest<Incoming>) -> String {
+        use std::fmt::Write;
+        
+        let query = req.uri().query().unwrap_or_default();
+        let params: HashMap<&str, &str> = query.split('&')
+            .filter_map(|s| {
+                let mut parts = s.splitn(2, '=');
+                parts.next().and_then(|key| parts.next().map(|val| (key, val)))
+            })
+            .collect();
+            
+        let filename = params.get("file").map(|s| *s).unwrap_or_default();
+        let line_idx: usize = params.get("line").and_then(|s| s.parse().ok()).unwrap_or(0);
+        
+        // Load and parse file
+        let mut file = EditableFile::new(filename, 0);
+        if let Err(e) = file.read_file() {
+             return self.generate_simple_page("Error", &format!("Failed to read file: {}", e));
+        }
+        if let Err(e) = file.parse() {
+             return self.generate_simple_page("Error", &format!("Failed to parse file: {}", e));
+        }
+        
+        if line_idx >= file.lines.len() {
+             return self.generate_simple_page("Error", "Invalid line index");
+        }
+        
+        let line = &file.lines[line_idx];
+        if line.line_type != crate::cgiedit::LineType::Action {
+             return self.generate_simple_page("Error", "Selected line is not an action line");
+        }
+        
+        let action_str = match &line.data {
+             crate::cgiedit::LineData::Action(s) => s,
+             _ => return self.generate_simple_page("Error", "Missing action data"),
+        };
+        
+        let mut action = crate::config::Action::default();
+        if let Err(e) = crate::loaders::parse_action_string(action_str, &mut action) {
+             return self.generate_simple_page("Error", &format!("Failed to parse action string: {}", e));
+        }
+        
+        let mut html = String::new();
+        html.push_str(&format!(r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Edit Action Line - Privoxy</title>
+    <link rel="stylesheet" href="/cgi-style.css">
+    <style>
+        .action-group {{ margin-bottom: 20px; border: 1px solid #ccc; padding: 10px; border-radius: 5px; }}
+        .action-group h2 {{ margin-top: 0; font-size: 1.2em; border-bottom: 1px solid #eee; }}
+        .action-item {{ margin: 5px 0; }}
+        label {{ cursor: pointer; }}
+    </style>
+</head>
+<body>
+    <h1>Edit Action Line</h1>
+    <p>File: <code>{}</code>, Line: {}</p>
+    
+    <form action="/edit-actions-submit" method="POST">
+        <input type="hidden" name="file" value="{}">
+        <input type="hidden" name="line" value="{}">
+        
+        <div class="action-group">
+            <h2>Core Actions</h2>
+            <div class="action-item">
+                <input type="checkbox" id="block" name="block" value="1" {} >
+                <label for="block">Block this request (+block)</label>
+            </div>
+            <div class="action-item">
+                <label for="block_reason">Block reason:</label>
+                <input type="text" id="block_reason" name="block_reason" value="{}" size="40">
+            </div>
+            <div class="action-item">
+                <input type="checkbox" id="handle_as_image" name="handle_as_image" value="1" {} >
+                <label for="handle_as_image">Handle as image (+handle-as-image)</label>
+            </div>
+        </div>
+
+        <div class="action-group">
+            <h2>Filters</h2>
+            <p>Enter filter names separated by spaces:</p>
+            <div class="action-item">
+                <label for="filter_names">Content Filters:</label><br>
+                <input type="text" id="filter_names" name="filter_names" value="{}" size="60">
+            </div>
+            <div class="action-item">
+                <label for="client_header_filter_names">Client Header Filters:</label><br>
+                <input type="text" id="client_header_filter_names" name="client_header_filter_names" value="{}" size="60">
+            </div>
+            <div class="action-item">
+                <label for="server_header_filter_names">Server Header Filters:</label><br>
+                <input type="text" id="server_header_filter_names" name="server_header_filter_names" value="{}" size="60">
+            </div>
+        </div>
+
+        <div class="action-group">
+            <h2>Privacy & Cookies</h2>
+            <div class="action-item">
+                <input type="checkbox" id="prevent_compression" name="prevent_compression" value="1" {} >
+                <label for="prevent_compression">Prevent compression (+prevent-compression)</label>
+            </div>
+            <div class="action-item">
+                <input type="checkbox" id="session_cookies_only" name="session_cookies_only" value="1" {} >
+                <label for="session_cookies_only">Session cookies only (+session-cookies-only)</label>
+            </div>
+            <div class="action-item">
+                <label for="hide_referrer">Hide Referrer:</label>
+                <input type="text" id="hide_referrer" name="hide_referrer" value="{}" size="40" placeholder="conditional|forge|block|URL">
+            </div>
+            <div class="action-item">
+                <label for="hide_user_agent">Hide User-Agent:</label>
+                <input type="text" id="hide_user_agent" name="hide_user_agent" value="{}" size="40" placeholder="e.g. Privoxy/4.1.0">
+            </div>
+            <div class="action-item">
+                <label for="set_image_blocker">Image Blocker:</label>
+                <input type="text" id="set_image_blocker" name="set_image_blocker" value="{}" size="40" placeholder="pattern|blank|URL">
+            </div>
+        </div>
+
+        <p>
+            <button type="submit">Update Actions</button>
+            <a href="/edit-actions-file?file={}">Cancel</a>
+        </p>
+    </form>
+</body>
+</html>"#, 
+            filename, line_idx,
+            filename, line_idx,
+            if action.block { "checked" } else { "" },
+            action.block_reason.as_deref().unwrap_or(""),
+            if action.handle_as_image { "checked" } else { "" },
+            action.filter_names.join(" "),
+            action.client_header_filter_names.join(" "),
+            action.server_header_filter_names.join(" "),
+            if action.prevent_compression { "checked" } else { "" },
+            if action.session_cookies_only { "checked" } else { "" },
+            action.hide_referrer.as_deref().unwrap_or(""),
+            action.hide_user_agent.as_deref().unwrap_or(""),
+            action.set_image_blocker.as_deref().unwrap_or(""),
+            filename
+        ));
+        
+        html
+    }
+
+    #[cfg(feature = "cgi-edit-actions")]
+    fn generate_delete_action_line(&self, req: &HyperRequest<Incoming>) -> String {
+        let query = req.uri().query().unwrap_or_default();
+        let params: HashMap<&str, &str> = query.split('&')
+            .filter_map(|s| {
+                let mut parts = s.splitn(2, '=');
+                parts.next().and_then(|key| parts.next().map(|val| (key, val)))
+            })
+            .collect();
+            
+        let filename = params.get("file").map(|s| *s).unwrap_or_default();
+        let line_idx: usize = params.get("line").and_then(|s| s.parse().ok()).unwrap_or(0);
+        
+        // Load and parse file
+        let mut file = EditableFile::new(filename, 0);
+        if let Err(e) = file.read_file() {
+            return self.generate_simple_page("Error", &format!("Failed to read file: {}", e));
+        }
+        
+        // Delete line
+        if let Err(e) = file.delete_line(line_idx) {
+            return self.generate_simple_page("Error", &format!("Failed to delete line: {}", e));
+        }
+        
+        // Save file
+        if let Err(e) = file.write_file() {
+            return self.generate_simple_page("Error", &format!("Failed to save file: {}", e));
+        }
+        
+        // Redirect back
+        format!(r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="1;url=/edit-actions-file?file={}">
+    <title>Line Deleted</title>
+</head>
+<body>
+    <h1>Line deleted successfully</h1>
+    <p>Returning to file view...</p>
+</body>
+</html>"#, filename)
+    }
+
+    #[cfg(feature = "cgi-edit-actions")]
+    fn handle_edit_actions_submit(&self, params: &HashMap<String, String>) -> String {
+        let filename = params.get("file").cloned().unwrap_or_default();
+        let line_idx: usize = params.get("line").and_then(|s| s.parse().ok()).unwrap_or(0);
+        
+        // Load file
+        let mut file = EditableFile::new(&filename, 0);
+        if let Err(e) = file.read_file() {
+            return self.generate_simple_page("Error", &format!("Failed to read file: {}", e));
+        }
+        if let Err(e) = file.parse() {
+            return self.generate_simple_page("Error", &format!("Failed to parse file: {}", e));
+        }
+        
+        // Construct new action string from params
+        let mut action_parts = Vec::new();
+        
+        // Block
+        if params.contains_key("block") {
+            let reason = params.get("block_reason").map(|s| s.trim()).unwrap_or("");
+            if reason.is_empty() {
+                action_parts.push("+block".to_string());
+            } else {
+                action_parts.push(format!("+block{{{}}}", reason));
+            }
+        } else {
+            action_parts.push("-block".to_string());
+        }
+        
+        // Handle as image
+        if params.contains_key("handle_as_image") {
+            action_parts.push("+handle-as-image".to_string());
+        } else {
+            action_parts.push("-handle-as-image".to_string());
+        }
+        
+        // Filters
+        if let Some(names) = params.get("filter_names") {
+            if !names.trim().is_empty() {
+                for name in names.split_whitespace() {
+                    action_parts.push(format!("+filter{{{}}}", name));
+                }
+            }
+        }
+        
+        if let Some(names) = params.get("client_header_filter_names") {
+            if !names.trim().is_empty() {
+                for name in names.split_whitespace() {
+                    action_parts.push(format!("+client-header-filter{{{}}}", name));
+                }
+            }
+        }
+
+        if let Some(names) = params.get("server_header_filter_names") {
+            if !names.trim().is_empty() {
+                for name in names.split_whitespace() {
+                    action_parts.push(format!("+server-header-filter{{{}}}", name));
+                }
+            }
+        }
+        
+        // Privacy & Headers
+        if let Some(val) = params.get("hide_referrer") {
+            if val == "default" {
+                action_parts.push("-hide-referrer".to_string());
+            } else {
+                action_parts.push(format!("+hide-referrer{{{}}}", val));
+            }
+        }
+
+        if let Some(val) = params.get("hide_user_agent") {
+            if val == "default" {
+                action_parts.push("-hide-user-agent".to_string());
+            } else {
+                action_parts.push(format!("+hide-user-agent{{{}}}", val));
+            }
+        }
+
+        if let Some(val) = params.get("set_image_blocker") {
+            if val == "default" {
+                action_parts.push("-set-image-blocker".to_string());
+            } else {
+                action_parts.push(format!("+set-image-blocker{{{}}}", val));
+            }
+        }
+        
+        if params.contains_key("prevent_compression") {
+            action_parts.push("+prevent-compression".to_string());
+        } else {
+            action_parts.push("-prevent-compression".to_string());
+        }
+        
+        if params.contains_key("session_cookies_only") {
+            action_parts.push("+session-cookies-only".to_string());
+        } else {
+            action_parts.push("-session-cookies-only".to_string());
+        }
+        
+        let new_action_str = action_parts.join(" ");
+        
+        // Update line
+        if let Some(line) = file.get_line_mut(line_idx) {
+            line.data = crate::cgiedit::LineData::Action(new_action_str);
+        } else {
+            return self.generate_simple_page("Error", "Invalid line index");
+        }
+        
+        // Save file
+        if let Err(e) = file.write_file() {
+            return self.generate_simple_page("Error", &format!("Failed to save file: {}", e));
+        }
+        
+        // Redirect back to file view (simple HTML redirect since we return String)
+        format!(r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="2;url=/edit-actions-file?file={}">
+    <title>Actions updated</title>
+</head>
+<body>
+    <h1>Actions updated successfully</h1>
+    <p>Returning to file view in 2 seconds...</p>
+    <p><a href="/edit-actions-file?file={}">Click here if not redirected</a></p>
+</body>
+</html>"#, filename, filename)
+    }
+
 
     #[cfg(feature = "cgi-edit-actions")]
     fn generate_edit_actions_for_url(&self, req: &HyperRequest<Incoming>) -> String {
@@ -956,211 +1407,162 @@ impl CgiHandler {
             <button type="submit">Edit Actions for this URL</button>
         </p>
     </form>
-    <p><a href="/edit-actions-list">Back to actions list</a></p>
-</body>
-</html>"#, encoded_url);
-        html
-    }
+"#, encoded_url);
 
-    #[cfg(feature = "cgi-edit-actions")]
-    fn generate_add_url_form(&self) -> String {
-        use std::fmt::Write;
-        
-        let mut html = String::new();
-        let _ = write!(html, r#"<!DOCTYPE html>
-<html>
-<head>
-    <title>Add URL Rule - Privoxy</title>
-    <link rel="stylesheet" href="/cgi-style.css">
-</head>
-<body>
-    <h1>Add URL Rule</h1>
-    <form action="/eas" method="POST">
-        <input type="hidden" name="action" value="add_url">
-        <p>
-            <label for="url_pattern">URL Pattern:</label><br>
-            <input type="text" id="url_pattern" name="url_pattern" size="60" placeholder="e.g., www.example.com/*">
-        </p>
-        <p>
-            <label for="actions">Actions:</label><br>
-            <textarea id="actions" name="actions" rows="5" cols="60" placeholder="{{+block}}"></textarea>
-        </p>
-        <p>
-            <button type="submit">Add URL Rule</button>
-        </p>
-    </form>
-    <p><a href="/edit-actions-list">Back to actions list</a></p>
+        if !url.is_empty() {
+            let config = self.config.clone();
+            let mut matches_found = false;
+            
+            let _ = write!(html, r#"<h2>Matches for {}:</h2>"#, encoded_url);
+            let _ = write!(html, r#"<table border="1" class="actions-table">
+                <tr><th>File</th><th>Section</th><th>Action</th><th>Edit</th></tr>"#);
+            
+            for url_action in &config.url_actions {
+                for pattern in &url_action.patterns {
+                    if crate::action::url_matches_pattern(&url, pattern) {
+                        matches_found = true;
+                        let file_display = Path::new(&url_action.file_name).file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| url_action.file_name.clone());
+                        
+                        let _ = write!(html, r#"<tr>
+                            <td>{}</td>
+                            <td>Line {}</td>
+                            <td><code>{}</code></td>
+                            <td><a href="/edit-actions-for-url?file={}&section={}">Edit</a></td>
+                        </tr>"#, 
+                            encode::html_encode(&file_display),
+                            url_action.line_number,
+                            encode::html_encode(&format!("{:?}", url_action.action)),
+                            encode::url_encode(&url_action.file_name),
+                            url_action.line_number
+                        );
+                        break; // Move to next UrlAction once one pattern in the section matches
+                    }
+                }
+            }
+            
+            if !matches_found {
+                let _ = write!(html, r#"<tr><td colspan="4">No matching sections found in any action file.</td></tr>"#);
+            }
+            let _ = write!(html, "</table>");
+        }
+
+        let _ = write!(html, r#"<p><a href="/edit-actions-list">Back to actions list</a></p>
 </body>
 </html>"#);
         html
     }
 
     #[cfg(feature = "cgi-edit-actions")]
-    fn generate_edit_url_form(&self, req: &HyperRequest<Incoming>) -> String {
-        use std::fmt::Write;
-        
-        let url = if let Some(query) = req.uri().query() {
-            let params: HashMap<&str, &str> = query.split('&')
-                .filter_map(|s| {
-                    let mut parts = s.splitn(2, '=');
-                    parts.next().and_then(|key| parts.next().map(|val| (key, val)))
-                })
-                .collect();
-            params.get("url").map(|s| s.to_string()).unwrap_or_default()
-        } else {
-            String::new()
-        };
-        
-        let encoded_url = encode::html_encode(&url);
-        let url_for_value = encode::url_encode(&url);
-        let mut html = String::new();
-        let _ = write!(html, r#"<!DOCTYPE html>
-<html>
-<head>
-    <title>Edit URL Actions - Privoxy</title>
-    <link rel="stylesheet" href="/cgi-style.css">
-</head>
-<body>
-    <h1>Edit Actions for URL</h1>
-    <p>URL: <strong>{}</strong></p>
-    <form action="/eas" method="POST">
-        <input type="hidden" name="action" value="edit_url">
-        <input type="hidden" name="url" value="{}">
-        <p>
-            <label for="actions">Actions:</label><br>
-            <textarea id="actions" name="actions" rows="10" cols="60"></textarea>
-        </p>
-        <p>
-            <button type="submit">Save Changes</button>
-            <a href="/edit-actions-list">Cancel</a>
-        </p>
-    </form>
-    <p><a href="/edit-actions-list">Back to actions list</a></p>
-</body>
-</html>"#, encoded_url, url_for_value);
-        html
-    }
 
     #[cfg(feature = "cgi-edit-actions")]
-    fn generate_remove_url_form(&self, req: &HyperRequest<Incoming>) -> String {
+    fn handle_edit_actions_for_url_submit(&self, params: &HashMap<String, String>) -> String {
         use std::fmt::Write;
         
-        let url = if let Some(query) = req.uri().query() {
-            let params: HashMap<&str, &str> = query.split('&')
-                .filter_map(|s| {
-                    let mut parts = s.splitn(2, '=');
-                    parts.next().and_then(|key| parts.next().map(|val| (key, val)))
-                })
-                .collect();
-            params.get("url").map(|s| s.to_string()).unwrap_or_default()
-        } else {
-            String::new()
-        };
-        
-        let encoded_url = encode::html_encode(&url);
-        let mut html = String::new();
-        let _ = write!(html, r#"<!DOCTYPE html>
-<html>
-<head>
-    <title>Remove URL Rule - Privoxy</title>
-    <link rel="stylesheet" href="/cgi-style.css">
-</head>
-<body>
-    <h1>Remove URL Rule</h1>
-    <form action="/eas" method="POST">
-        <input type="hidden" name="action" value="remove_url">
-        <p>
-            <label for="url_pattern">URL Pattern to Remove:</label><br>
-            <input type="text" id="url_pattern" name="url_pattern" value="{}" size="60">
-        </p>
-        <p>
-            <button type="submit" onclick="return confirm('Are you sure you want to remove this URL rule?')">Remove URL Rule</button>
-        </p>
-    </form>
-    <p><a href="/edit-actions-list">Back to actions list</a></p>
-</body>
-</html>"#, encoded_url);
-        html
-    }
-
-    #[cfg(feature = "cgi-edit-actions")]
-    fn handle_edit_actions_submit(&self, params: &HashMap<String, String>) -> String {
-        use std::fmt::Write;
-        use std::fs;
-        
+        let filename = params.get("file").cloned().unwrap_or_default();
         let action = params.get("action").map(|s| s.as_str()).unwrap_or("");
         
+        // Load file
+        let mut file = EditableFile::new(&filename, 0);
+        if let Err(e) = file.read_file() {
+            return self.generate_simple_page("Error", &format!("Failed to read file: {}", e));
+        }
+        if let Err(e) = file.parse() {
+            return self.generate_simple_page("Error", &format!("Failed to parse file: {}", e));
+        }
+
         let result = match action {
             "add_url" => {
-                let url_pattern = params.get("url_pattern").map(|s| s.as_str()).unwrap_or("");
-                let actions = params.get("actions").map(|s| s.as_str()).unwrap_or("");
+                let url_pattern = params.get("url_pattern").map(|s| s.trim()).unwrap_or("");
+                let line_idx: usize = params.get("line").and_then(|s| s.parse().ok()).unwrap_or(0);
                 
-                // Add URL rule to user.action file
-                let user_action_path = "user.action";
-                let mut content = String::new();
-                
-                if let Ok(existing) = fs::read_to_string(user_action_path) {
-                    content = existing;
+                if url_pattern.is_empty() {
+                    return self.generate_simple_page("Error", "URL pattern cannot be empty");
                 }
                 
-                // Append new rule
-                content.push_str(&format!("{{{}}}\n{}\n", actions, url_pattern));
-                
-                match fs::write(user_action_path, &content) {
-                    Ok(_) => format!("Added URL rule: {} with actions: {}", 
-                        encode::html_encode(url_pattern), encode::html_encode(actions)),
-                    Err(e) => format!("Failed to write to {}: {}", 
-                        encode::html_encode(user_action_path), encode::html_encode(&format!("{}", e))),
+                match file.insert_url_pattern(line_idx, url_pattern) {
+                    Ok(_) => format!("Added URL rule: {}", encode::html_encode(url_pattern)),
+                    Err(e) => format!("Failed to add URL rule: {}", encode::html_encode(&format!("{}", e))),
+                }
+            }
+            
+            "remove_url" => {
+                let line_idx: usize = params.get("line").and_then(|s| s.parse().ok()).unwrap_or(0);
+                match file.delete_line(line_idx) {
+                    Ok(_) => "URL rule removed successfully".to_string(),
+                    Err(e) => format!("Failed to remove URL rule: {}", encode::html_encode(&format!("{}", e))),
                 }
             }
             
             "edit_url" => {
-                let url = params.get("url").map(|s| s.as_str()).unwrap_or("");
-                let actions = params.get("actions").map(|s| s.as_str()).unwrap_or("");
+                let url_pattern = params.get("url_pattern").map(|s| s.trim()).unwrap_or("");
+                let line_idx: usize = params.get("line").and_then(|s| s.parse().ok()).unwrap_or(0);
                 
-                format!("Updated actions for URL: {}<br>New actions: {}", 
-                    encode::html_encode(url), encode::html_encode(actions))
-            }
-            
-            "remove_url" => {
-                let url_pattern = params.get("url_pattern").map(|s| s.as_str()).unwrap_or("");
-                format!("Removed URL rule: {}", encode::html_encode(url_pattern))
+                if let Some(line) = file.get_line_mut(line_idx) {
+                    if line.line_type == crate::cgiedit::LineType::Url {
+                        line.unprocessed = url_pattern.to_string();
+                        line.raw = format!("{}\n", url_pattern);
+                        format!("Updated URL rule to: {}", encode::html_encode(url_pattern))
+                    } else {
+                        "Line is not a URL pattern".to_string()
+                    }
+                } else {
+                    "Invalid line index".to_string()
+                }
             }
             
             "add_section" => {
-                let section_type = params.get("section_type").map(|s| s.as_str()).unwrap_or("");
-                format!("Added section: {}", encode::html_encode(section_type))
+                let line_idx: usize = params.get("line").and_then(|s| s.parse().ok()).unwrap_or(0);
+                let actions = params.get("actions").map(|s| s.trim()).unwrap_or("");
+                
+                match file.insert_section(line_idx, actions) {
+                    Ok(_) => format!("New section created with actions: {}", encode::html_encode(actions)),
+                    Err(e) => format!("Failed to create section: {}", encode::html_encode(&format!("{}", e))),
+                }
             }
             
             "remove_section" => {
-                let section_index = params.get("section_index").map(|s| s.as_str()).unwrap_or("");
-                format!("Removed section at index: {}", encode::html_encode(section_index))
+                let line_idx: usize = params.get("line").and_then(|s| s.parse().ok()).unwrap_or(0);
+                match file.delete_line(line_idx) {
+                    Ok(_) => "Action section removed successfully".to_string(),
+                    Err(e) => format!("Failed to remove section: {}", encode::html_encode(&format!("{}", e))),
+                }
             }
             
             "swap_sections" => {
-                let section1 = params.get("section1").map(|s| s.as_str()).unwrap_or("");
-                let section2 = params.get("section2").map(|s| s.as_str()).unwrap_or("");
-                format!("Swapped sections {} and {}", 
-                    encode::html_encode(section1), encode::html_encode(section2))
+                let idx1: usize = params.get("section1").and_then(|s| s.parse().ok()).unwrap_or(0);
+                let idx2: usize = params.get("section2").and_then(|s| s.parse().ok()).unwrap_or(0);
+                match file.swap_lines(idx1, idx2) {
+                    Ok(_) => "Sections swapped successfully".to_string(),
+                    Err(e) => format!("Failed to swap sections: {}", encode::html_encode(&format!("{}", e))),
+                }
             }
             
             _ => "Unknown action".to_string(),
         };
         
-        let mut html = String::new();
-        let _ = write!(html, r#"<!DOCTYPE html>
+        // Save file if successful (crude check: if result doesn't contain "Failed")
+        if !result.contains("Failed") && !result.contains("Unknown") && !result.contains("Invalid") {
+             if let Err(e) = file.write_file() {
+                return self.generate_simple_page("Error", &format!("Failed to save file: {}", e));
+            }
+        }
+        
+        // Redirect back
+        format!(r#"<!DOCTYPE html>
 <html>
 <head>
-    <title>Action Result - Privoxy</title>
-    <link rel="stylesheet" href="/cgi-style.css">
+    <meta http-equiv="refresh" content="2;url=/edit-actions-file?file={}">
+    <title>Action Result</title>
 </head>
 <body>
     <h1>Action Result</h1>
     <p>{}</p>
-    <p><a href="/edit-actions-list">Back to actions list</a></p>
+    <p>Returning to file view in 2 seconds...</p>
+    <p><a href="/edit-actions-file?file={}">Click here if not redirected</a></p>
 </body>
-</html>"#, result);
-        html
+</html>"#, filename, result, filename)
     }
 
     #[cfg(feature = "cgi-edit-actions")]
@@ -1193,8 +1595,13 @@ impl CgiHandler {
     }
 
     #[cfg(feature = "cgi-edit-actions")]
-    fn generate_add_section_form(&self) -> String {
+    #[cfg(feature = "cgi-edit-actions")]
+    fn generate_add_section_form(&self, req: &HyperRequest<Incoming>) -> String {
         use std::fmt::Write;
+        let query = req.uri().query().unwrap_or_default();
+        let params = self.parse_query_string(query);
+        let filename = params.get("file").cloned().unwrap_or_default();
+        let line_idx = params.get("line").cloned().unwrap_or_default();
         
         let mut html = String::new();
         let _ = write!(html, r#"<!DOCTYPE html>
@@ -1207,28 +1614,29 @@ impl CgiHandler {
     <h1>Add Section</h1>
     <form action="/eas" method="POST">
         <input type="hidden" name="action" value="add_section">
+        <input type="hidden" name="file" value="{}">
+        <input type="hidden" name="line" value="{}">
         <p>
-            <label for="section_type">Section Type:</label>
-            <select id="section_type" name="section_type">
-                <option value="alias">{{alias}}</option>
-                <option value="action">{{action}}</option>
-                <option value="settings">{{settings}}</option>
-                <option value="description">{{description}}</option>
-            </select>
+            <label for="actions">Actions for new section (e.g. +block{{reason}}):</label><br>
+            <input type="text" id="actions" name="actions" size="60">
         </p>
         <p>
-            <button type="submit">Add Section</button>
+            <button type="submit">Create Section</button>
+            <a href="/edit-actions-file?file={}">Cancel</a>
         </p>
     </form>
-    <p><a href="/edit-actions-list">Back to actions list</a></p>
 </body>
-</html>"#);
+</html>"#, filename, line_idx, filename);
         html
     }
 
     #[cfg(feature = "cgi-edit-actions")]
-    fn generate_remove_section_form(&self) -> String {
+    fn generate_remove_section_form(&self, req: &HyperRequest<Incoming>) -> String {
         use std::fmt::Write;
+        let query = req.uri().query().unwrap_or_default();
+        let params = self.parse_query_string(query);
+        let filename = params.get("file").cloned().unwrap_or_default();
+        let line_idx = params.get("line").cloned().unwrap_or_default();
         
         let mut html = String::new();
         let _ = write!(html, r#"<!DOCTYPE html>
@@ -1239,25 +1647,27 @@ impl CgiHandler {
 </head>
 <body>
     <h1>Remove Section</h1>
+    <p>Are you sure you want to remove the section at line {} in file <code>{}</code>?</p>
     <form action="/eas" method="POST">
         <input type="hidden" name="action" value="remove_section">
+        <input type="hidden" name="file" value="{}">
+        <input type="hidden" name="line" value="{}">
         <p>
-            <label for="section_index">Section Index:</label><br>
-            <input type="number" id="section_index" name="section_index" min="0">
-        </p>
-        <p>
-            <button type="submit" onclick="return confirm('Are you sure you want to remove this section?')">Remove Section</button>
+            <button type="submit" onclick="return confirm('Really delete entire section?')">Remove Section</button>
+            <a href="/edit-actions-file?file={}">Cancel</a>
         </p>
     </form>
-    <p><a href="/edit-actions-list">Back to actions list</a></p>
 </body>
-</html>"#);
+</html>"#, line_idx, filename, filename, line_idx, filename);
         html
     }
 
     #[cfg(feature = "cgi-edit-actions")]
-    fn generate_swap_sections_form(&self) -> String {
+    fn generate_swap_sections_form(&self, req: &HyperRequest<Incoming>) -> String {
         use std::fmt::Write;
+        let query = req.uri().query().unwrap_or_default();
+        let params = self.parse_query_string(query);
+        let filename = params.get("file").cloned().unwrap_or_default();
         
         let mut html = String::new();
         let _ = write!(html, r#"<!DOCTYPE html>
@@ -1270,21 +1680,22 @@ impl CgiHandler {
     <h1>Swap Sections</h1>
     <form action="/eas" method="POST">
         <input type="hidden" name="action" value="swap_sections">
+        <input type="hidden" name="file" value="{}">
         <p>
-            <label for="section1">First Section Index:</label><br>
+            <label for="section1">First line index:</label><br>
             <input type="number" id="section1" name="section1" min="0">
         </p>
         <p>
-            <label for="section2">Second Section Index:</label><br>
+            <label for="section2">Second line index:</label><br>
             <input type="number" id="section2" name="section2" min="0">
         </p>
         <p>
-            <button type="submit">Swap Sections</button>
+            <button type="submit">Swap Lines</button>
+            <a href="/edit-actions-file?file={}">Cancel</a>
         </p>
     </form>
-    <p><a href="/edit-actions-list">Back to actions list</a></p>
 </body>
-</html>"#);
+</html>"#, filename, filename);
         html
     }
 
@@ -1342,31 +1753,67 @@ impl CgiHandler {
         "<!-- Transparent image placeholder -->".to_string()
     }
 
-    fn send_banner(&self) -> Result<Response<Full<Bytes>>, hyper::Error> {
-        // Generate a simple banner image (1x1 transparent pixel as placeholder)
-        // In a real implementation, this would load banner.png from templates
-        let banner_data = vec![
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
-            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1
-            0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
-            0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, // IDAT chunk
-            0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
-            0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
-            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, // IEND chunk
-            0x42, 0x60, 0x82,
-        ];
+    /// Send a transparent or pattern banner (GIF)
+    fn send_banner<B>(&self, req: &hyper::Request<B>) -> Result<Response<Full<Bytes>>, hyper::Error> {
+        let query = req.uri().query().unwrap_or("");
+        let params = self.parse_query_string(query);
+        let type_param = params.get("type").map(|s| s.as_str()).unwrap_or("trans");
+        
+        let data = if type_param == "pattern" {
+            // Pattern GIF from C code: 1x1 gray pixel
+            vec![
+                0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 
+                0x00, 0x80, 0x80, 0x80, 0x00, 0x00, 0x00, 0x21, 0xf9, 0x04, 0x00, 0x00, 
+                0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 
+                0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b
+            ]
+        } else {
+            // Transparent GIF from C code
+            vec![
+                0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 
+                0x00, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x21, 0xf9, 0x04, 0x01, 0x00, 
+                0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 
+                0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b
+            ]
+        };
         
         Ok(Response::builder()
             .status(StatusCode::OK)
-            .header("Content-Type", "image/png")
-            .body(Full::new(Bytes::from(banner_data)))
+            .header("Content-Type", "image/gif")
+            .body(Full::new(Bytes::from(data)))
             .unwrap())
     }
 
     fn send_transparent_image(&self) -> Result<Response<Full<Bytes>>, hyper::Error> {
-        // Same as banner - 1x1 transparent PNG
-        self.send_banner()
+        // 1x1 transparent GIF
+        let data = vec![
+            0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 
+            0x00, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x21, 0xf9, 0x04, 0x01, 0x00, 
+            0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 
+            0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b
+        ];
+        
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "image/gif")
+            .body(Full::new(Bytes::from(data)))
+            .unwrap())
+    }
+
+    /// Send the Privoxy favicon
+    fn send_favicon(&self) -> Result<Response<Full<Bytes>>, hyper::Error> {
+        // Try to load from assets, fallback to empty if fails
+        let icon_path = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("assets")
+            .join("privoxy.ico");
+        let data = fs::read(&icon_path).unwrap_or_else(|_| Vec::new());
+        
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "image/x-icon")
+            .body(Full::new(Bytes::from(data)))
+            .unwrap())
     }
 
     fn generate_user_manual(&self) -> String {
@@ -1425,10 +1872,17 @@ impl CgiHandler {
     }
 
     /// Generate show-request page using template
-    fn generate_show_request(&self) -> String {
+    fn generate_show_request<B>(&self, req: &hyper::Request<B>) -> String {
         if let Some(template) = self.load_template("show-request") {
-            let symbols = self.create_common_symbols();
-            // Add request-specific symbols here when implemented
+            let mut symbols = self.create_common_symbols();
+            
+            // Build raw request string for display
+            let mut raw_request = format!("{} {} {:?}\r\n", req.method(), req.uri(), req.version());
+            for (name, value) in req.headers() {
+                raw_request.push_str(&format!("{}: {:?}\r\n", name, value));
+            }
+            symbols.insert("client-request".to_string(), crate::encode::html_encode(&raw_request));
+            
             self.render_template(&template, &symbols)
         } else {
             self.generate_simple_page("Request Headers", "Request headers will be displayed here")
@@ -1436,14 +1890,84 @@ impl CgiHandler {
     }
 
     /// Generate show-url-info page using template
-    fn generate_show_url_info(&self) -> String {
-        if let Some(template) = self.load_template("show-url-info") {
-            let symbols = self.create_common_symbols();
-            // Add URL info-specific symbols here when implemented
-            self.render_template(&template, &symbols)
+    fn generate_show_url_info<B>(&self, req: &hyper::Request<B>) -> String {
+        use std::fmt::Write;
+        
+        // Parse URL from query string
+        let url = if let Some(query) = req.uri().query() {
+            let params = self.parse_query_string(query);
+            params.get("url").cloned().unwrap_or_default()
         } else {
-            self.generate_simple_page("URL Info Lookup", "Look up which actions apply to a URL")
+            String::new()
+        };
+        
+        if url.is_empty() {
+            return self.generate_simple_page("URL Info Lookup", 
+                r#"<form action="/show-url-info" method="GET">
+                    <p>Enter a URL to see which actions apply to it:</p>
+                    <input type="text" name="url" size="80" placeholder="http://example.com/">
+                    <input type="submit" value="Look up">
+                </form>"#);
         }
+
+        let mut html = String::new();
+        let _ = write!(html, r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>URL Info - {} - Privoxy</title>
+    <link rel="stylesheet" href="/cgi-style.css">
+</head>
+<body>
+    <h1>URL Info for <code>{}</code></h1>
+"#, encode::html_encode(&url), encode::html_encode(&url));
+
+        let config = self.config.clone();
+        let mut matches_found = false;
+        
+        let _ = write!(html, r#"<h2>Matching Sections:</h2>
+            <table border="1" class="actions-table">
+            <tr><th>File</th><th>Line</th><th>Pattern</th><th>Actions</th></tr>"#);
+        
+        for url_action in &config.url_actions {
+            for pattern in &url_action.patterns {
+                if crate::action::url_matches_pattern(&url, pattern) {
+                    matches_found = true;
+                    let file_display = std::path::Path::new(&url_action.file_name).file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| url_action.file_name.clone());
+                    
+                    let _ = write!(html, r#"<tr>
+                        <td>{}</td>
+                        <td>{}</td>
+                        <td><code>{}</code></td>
+                        <td><code>{:?}</code></td>
+                    </tr>"#, 
+                        encode::html_encode(&file_display),
+                        url_action.line_number,
+                        encode::html_encode(pattern),
+                        url_action.action
+                    );
+                    break; // Move to next UrlAction once one pattern matches
+                }
+            }
+        }
+        
+        if !matches_found {
+            let _ = write!(html, r#"<tr><td colspan="4">No matching sections found.</td></tr>"#);
+        }
+        let _ = write!(html, "</table>");
+        
+        // Show final combined actions
+        let final_action = crate::action::find_action_for_url(&url, &config);
+        if let Some(a) = final_action {
+            let _ = write!(html, r#"<h2>Final Cumulative Action:</h2>
+                <pre class="action-block">{:?}</pre>"#, a);
+        }
+
+        let _ = write!(html, r#"<p><a href="/">Back to main page</a></p>
+</body>
+</html>"#);
+        html
     }
 
     /// Generate client-tags page using template
@@ -1516,6 +2040,112 @@ impl CgiHandler {
 </html>"#, client_count, clients_html);
             html
         }
+    }
+
+    #[cfg(feature = "cgi-edit-actions")]
+    fn generate_add_url_form(&self, req: &HyperRequest<Incoming>) -> String {
+        use std::fmt::Write;
+        let query = req.uri().query().unwrap_or_default();
+        let params = self.parse_query_string(query);
+        let filename = params.get("file").cloned().unwrap_or_default();
+        let line_idx = params.get("line").cloned().unwrap_or_default();
+        
+        let mut html = String::new();
+        let _ = write!(html, r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Add URL Rule - Privoxy</title>
+    <link rel="stylesheet" href="/cgi-style.css">
+</head>
+<body>
+    <h1>Add URL Rule</h1>
+    <p>Adding rule to file: <code>{}</code> after line: {}</p>
+    <form action="/eas" method="POST">
+        <input type="hidden" name="file" value="{}">
+        <input type="hidden" name="line" value="{}">
+        <input type="hidden" name="action" value="add_url">
+        <p>
+            <label for="url_pattern">URL Pattern:</label><br>
+            <input type="text" id="url_pattern" name="url_pattern" size="60" placeholder="e.g., www.example.com/*">
+        </p>
+        <p>
+            <button type="submit">Add URL Rule</button>
+            <a href="/edit-actions-file?file={}">Cancel</a>
+        </p>
+    </form>
+</body>
+</html>"#, filename, line_idx, filename, line_idx, filename);
+        html
+    }
+
+    #[cfg(feature = "cgi-edit-actions")]
+    fn generate_edit_url_form(&self, req: &HyperRequest<Incoming>) -> String {
+        use std::fmt::Write;
+        let query = req.uri().query().unwrap_or_default();
+        let params = self.parse_query_string(query);
+        let filename = params.get("file").cloned().unwrap_or_default();
+        let line_idx = params.get("line").cloned().unwrap_or_default();
+        let current_pattern = params.get("pattern").cloned().unwrap_or_default();
+        
+        let mut html = String::new();
+        let _ = write!(html, r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Edit URL Rule - Privoxy</title>
+    <link rel="stylesheet" href="/cgi-style.css">
+</head>
+<body>
+    <h1>Edit URL Rule</h1>
+    <form action="/eas" method="POST">
+        <input type="hidden" name="file" value="{}">
+        <input type="hidden" name="line" value="{}">
+        <input type="hidden" name="action" value="edit_url">
+        <p>
+            <label for="url_pattern">URL Pattern:</label><br>
+            <input type="text" id="url_pattern" name="url_pattern" value="{}" size="60">
+        </p>
+        <p>
+            <button type="submit">Update URL Rule</button>
+            <a href="/edit-actions-file?file={}">Cancel</a>
+        </p>
+    </form>
+</body>
+</html>"#, filename, line_idx, current_pattern, filename);
+        html
+    }
+
+    #[cfg(feature = "cgi-edit-actions")]
+    fn generate_remove_url_form(&self, req: &HyperRequest<Incoming>) -> String {
+        use std::fmt::Write;
+        let query = req.uri().query().unwrap_or_default();
+        let params = self.parse_query_string(query);
+        let filename = params.get("file").cloned().unwrap_or_default();
+        let line_idx = params.get("line").cloned().unwrap_or_default();
+        let pattern = params.get("pattern").cloned().unwrap_or_default();
+        
+        let mut html = String::new();
+        let _ = write!(html, r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Remove URL Rule - Privoxy</title>
+    <link rel="stylesheet" href="/cgi-style.css">
+</head>
+<body>
+    <h1>Remove URL Rule</h1>
+    <p>Are you sure you want to remove the following URL rule from <code>{}</code>?</p>
+    <p><code>{}</code></p>
+    <form action="/eas" method="POST">
+        <input type="hidden" name="file" value="{}">
+        <input type="hidden" name="line" value="{}">
+        <input type="hidden" name="action" value="remove_url">
+        <p>
+            <button type="submit">Yes, remove this rule</button>
+            <a href="/edit-actions-file?file={}">Cancel</a>
+        </p>
+    </form>
+</body>
+</html>"#, filename, pattern, filename, line_idx, filename);
+        html
     }
 
     #[cfg(feature = "client-tags")]
@@ -1979,6 +2609,31 @@ mod tests {
     }
 
     #[test]
+    fn test_render_template_if_else_hyphen() {
+        let mut symbols = HashMap::new();
+        symbols.insert("have-stats".to_string(), "1".to_string());
+        let template = "@if-have-stats-then@YES@else-not-have-stats@NO@endif-have-stats@";
+        let handler = create_test_handler();
+        let rendered = handler.render_template(template, &symbols);
+        assert_eq!(rendered, "YES");
+
+        let mut symbols2 = HashMap::new();
+        symbols2.insert("have-stats".to_string(), "".to_string());
+        let rendered2 = handler.render_template(template, &symbols2);
+        assert_eq!(rendered2, "NO");
+    }
+
+    #[test]
+    fn test_render_template_conditional_hyphen() {
+        let mut symbols = HashMap::new();
+        symbols.insert("have-stats".to_string(), "1".to_string());
+        let template = "@if-have-statsstart@CONTENT@if-have-stats-end@";
+        let handler = create_test_handler();
+        let rendered = handler.render_template(template, &symbols);
+        assert_eq!(rendered, "CONTENT");
+    }
+
+    #[test]
     fn test_generate_404_page() {
         let handler = create_test_handler();
         let html = handler.generate_404_page();
@@ -1990,7 +2645,8 @@ mod tests {
     #[test]
     fn test_generate_show_request() {
         let handler = create_test_handler();
-        let html = handler.generate_show_request();
+        let req = hyper::Request::builder().uri("/show-request").body(()).unwrap();
+        let html = handler.generate_show_request(&req);
         
         // Should return some valid HTML
         assert!(html.contains("<!DOCTYPE html>") || html.contains("<html"));
@@ -1999,10 +2655,12 @@ mod tests {
     #[test]
     fn test_generate_show_url_info() {
         let handler = create_test_handler();
-        let html = handler.generate_show_url_info();
+        let req = hyper::Request::builder().uri("/show-url-info?url=http://example.com").body(()).unwrap();
+        let html = handler.generate_show_url_info(&req);
         
         // Should return some valid HTML
         assert!(html.contains("<!DOCTYPE html>") || html.contains("<html"));
+        assert!(html.contains("http://example.com"));
     }
 
     #[test]
@@ -2017,13 +2675,13 @@ mod tests {
     #[test]
     fn test_send_banner() {
         let handler = create_test_handler();
-        let result = handler.send_banner();
+        let req = hyper::Request::builder().uri("/send-banner?type=trans").body(()).unwrap();
+        let result = handler.send_banner(&req);
         
         assert!(result.is_ok());
         let response = result.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        // Note: Content-Type may vary based on implementation
-        assert!(response.headers().get("Content-Type").is_some());
+        assert_eq!(response.headers().get("Content-Type").unwrap(), "image/gif");
     }
 
     #[test]
@@ -2058,6 +2716,21 @@ mod tests {
         let handler = create_test_handler();
         let html = handler.generate_die();
         
-        assert!(html.contains("Shut Down"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_query_string() {
+        let config = Arc::new(Config::default());
+        let state = Arc::new(AppState::new(config.clone()));
+        let handler = CgiHandler::new(config, state);
+        
+        let params = handler.parse_query_string("file=test.action&section=1&name=val%20ue");
+        assert_eq!(params.get("file").unwrap(), &"test.action");
+        assert_eq!(params.get("section").unwrap(), &"1");
+        assert_eq!(params.get("name").unwrap(), &"val ue");
+        
+        let params2 = handler.parse_query_string("key_only&key2=");
+        assert_eq!(params2.get("key_only").unwrap(), &"");
+        assert_eq!(params2.get("key2").unwrap(), &"");
     }
 }

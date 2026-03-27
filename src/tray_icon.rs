@@ -35,7 +35,7 @@ use windows::Win32::Foundation::HINSTANCE;
 pub struct TrayIconApp {
     config: Arc<Config>,
     state: Arc<AppState>,
-    shutdown_sender: Option<tokio::sync::oneshot::Sender<()>>,
+    shutdown_sender: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     log_messages: bool,
     message_highlighting: bool,
     limit_buffer_size: bool,
@@ -61,7 +61,7 @@ impl TrayIconApp {
         let max_buffer_lines = 200;
         
         // Initialize logging with GUI cache support
-        let log_level = if config.log_level & crate::constants::LOG_LEVEL_HEADER != 0 {
+        let _log_level = if config.log_level & crate::constants::LOG_LEVEL_HEADER != 0 {
             "debug"
         } else if config.log_level & crate::constants::LOG_LEVEL_ERROR != 0 {
             "error"
@@ -69,9 +69,8 @@ impl TrayIconApp {
             "info"
         };
         
-        if let Err(e) = logger::init_logging_with_gui(log_level, Some(log_cache.clone()), max_buffer_lines) {
-            eprintln!("Failed to initialize GUI logging: {}", e);
-        }
+        // Register the log cache with the global registry (initialized in main.rs)
+        crate::logger::register_gui_cache(log_cache.clone());
         
         // Open log file if configured
         let log_file = match config.log_file.as_ref() {
@@ -102,7 +101,7 @@ impl TrayIconApp {
         Self {
             config,
             state,
-            shutdown_sender: Some(shutdown_sender),
+            shutdown_sender: Arc::new(std::sync::Mutex::new(Some(shutdown_sender))),
             log_messages: true,
             message_highlighting: true,
             limit_buffer_size: true,
@@ -119,8 +118,24 @@ impl TrayIconApp {
     }
 
     fn show_window(&mut self) {
-        // Start a new thread for the UI
+        // Find existing UI handles in the log cache
+        if let Ok(cache) = self.log_cache.lock() {
+            if let Some(ref ui_handles) = cache.1 {
+                info!("Found existing UI window, showing it");
+                let mut window = ui_handles.window.clone();
+                ui_handles.ui.queue_main(move || {
+                    window.show();
+                });
+                return;
+            }
+        }
+        
+        // If not found, fall back to starting the UI thread
+        info!("Starting new UI thread (fallback)");
         let log_cache = self.log_cache.clone();
+        let shutdown_sender_arc = self.shutdown_sender.clone();
+        let visible_on_start = self.show_window;
+        
         let thread = std::thread::spawn(move || {
             // Initialize libui
             let ui = UI::init().expect("Failed to initialize UI");
@@ -135,8 +150,14 @@ impl TrayIconApp {
             });
             file_menu.append_separator();
             let exit_item = file_menu.append_item("Exit");
-            exit_item.on_clicked(|_, _| {
+            let shutdown_sender_ui = shutdown_sender_arc.clone();
+            exit_item.on_clicked(move |_, _| {
                 info!("File -> Exit clicked");
+                if let Ok(mut guard) = shutdown_sender_ui.lock() {
+                    if let Some(sender) = guard.take() {
+                        let _ = sender.send(());
+                    }
+                }
                 std::process::exit(0);
             });
             
@@ -357,8 +378,8 @@ This program comes with ABSOLUTELY NO WARRANTY OF ANY KIND.", crate::constants::
             
             // --- Step 2: Create window with menubar enabled ---
             // Window size with golden ratio (1.618:1)
-            // Width: 1215, Height: 750 (1215/750 ≈ 1.62)
-            let mut window = Window::new(&ui, "Privoxy", 1215, 750, WindowType::HasMenubar);
+            // Width: 2430, Height: 1500 (Doubled from 1215x750)
+            let mut window = Window::new(&ui, "Privoxy", 2430, 1500, WindowType::HasMenubar);
             
             // Create vertical box
             let mut vbox = VerticalBox::new();
@@ -396,8 +417,19 @@ This program comes with ABSOLUTELY NO WARRANTY OF ANY KIND.", crate::constants::
             // Set window content
             window.set_child(vbox);
             
-            // Show window
-            window.show();
+            // Show window initially (optional, user said it should show on first click)
+            if visible_on_start {
+                window.show();
+            } else {
+                window.hide();
+            }
+            
+            // Handle window closing: hide instead of destroy
+            let mut window_clone = window.clone();
+            window.on_closing(&ui, move |_| {
+                info!("Log window closing, hiding instead");
+                window_clone.hide();
+            });
             
             // Store UI handles in log cache for real-time updates
             {
@@ -406,6 +438,7 @@ This program comes with ABSOLUTELY NO WARRANTY OF ANY KIND.", crate::constants::
                     {
                         cache.1 = Some(logger::UiLogHandles {
                             ui: ui.clone(),
+                            window: window.clone(),
                             log_textarea: log_textarea_handle.clone(),
                         });
                     }
@@ -418,21 +451,22 @@ This program comes with ABSOLUTELY NO WARRANTY OF ANY KIND.", crate::constants::
                 move |_, _| {
                     info!("View -> Clear Log clicked");
                     
-                    // Clear the log cache
-                    if let Ok(mut cache) = log_cache.lock() {
-                        #[cfg(feature = "tray-icon")]
-                        {
-                            cache.0.clear();
+                    {
+                        // Clear the log cache - release lock BEFORE any logging
+                        if let Ok(mut cache) = log_cache.lock() {
+                            #[cfg(feature = "tray-icon")]
+                            {
+                                cache.0.clear();
+                            }
+                            #[cfg(not(feature = "tray-icon"))]
+                            {
+                                cache.clear();
+                            }
                         }
-                        #[cfg(not(feature = "tray-icon"))]
-                        {
-                            cache.clear();
-                        }
-                        info!("Log cache cleared");
                     }
+                    info!("Log cache cleared");
                     
                     // Clear the UI textarea using the cloned handle
-                    // This works because clone() creates another reference to the same C control
                     log_textarea_handle.set_value("");
                     info!("Log textarea cleared in real-time");
                 }
@@ -608,20 +642,6 @@ This program comes with ABSOLUTELY NO WARRANTY OF ANY KIND.", crate::constants::
         // Create top-level Toggle Enabled menu item
         let menu_item_toggle = TrayMenuItem::new("Toggle Enabled", true, None);
         
-        // Create main menu with all submenus and items
-        let menu = TrayMenu::with_items(&[
-            &submenu_file,
-            &submenu_view,
-            &submenu_tools,
-            &submenu_help,
-            &PredefinedMenuItem::separator(),
-            &menu_item_toggle,
-        ]).map_err(|e| PrivoxyError::Other(format!("Menu error: {}", e)))?;
-
-        // Load icon from embedded resource or file
-        let icon = load_icon().map_err(|e| PrivoxyError::Other(format!("Failed to load icon: {}", e)))?;
-        let menu_item_exit = TrayMenuItem::new("Exit", true, None);
-        
         // Create File submenu
         let submenu_file = Submenu::with_items(
             "File",
@@ -787,7 +807,7 @@ This program comes with ABSOLUTELY NO WARRANTY OF ANY KIND.", crate::constants::
         let mut tray_icon_created = false;
         
         // Create a channel to receive shutdown signal
-        let (shutdown_notify_tx, shutdown_notify_rx) = std::sync::mpsc::channel::<()>();
+        let (_shutdown_notify_tx, shutdown_notify_rx) = std::sync::mpsc::channel::<()>();
         
         // Monitor for shutdown signal in a separate thread
         std::thread::spawn(move || {
@@ -838,14 +858,34 @@ This program comes with ABSOLUTELY NO WARRANTY OF ANY KIND.", crate::constants::
                 } else if event_id == &exit_id {
                     // Send shutdown signal and exit gracefully
                     info!("Exiting Privoxy");
-                    if let Some(sender) = self.shutdown_sender.take() {
+                    if let Some(sender) = self.shutdown_sender.lock().unwrap().take() {
                         let _ = sender.send(());
                     }
                     // Exit the event loop
                     std::process::exit(0);
                 } else if event_id == &clear_log_id {
                     // Clear log
-                    info!("Clear log clicked");
+                    info!("Tray -> Clear Log clicked");
+                    let mut ui_handles = None;
+                    
+                    {
+                        if let Ok(mut cache) = self.log_cache.lock() {
+                            #[cfg(feature = "tray-icon")]
+                            {
+                                cache.0.clear();
+                                ui_handles = cache.1.clone();
+                            }
+                        }
+                    }
+                    info!("Log cache cleared via tray");
+                    
+                    if let Some(handles) = ui_handles {
+                        let mut textarea = handles.log_textarea.clone();
+                        handles.ui.queue_main(move || {
+                            textarea.set_value("");
+                        });
+                        info!("Log textarea clear queued from tray thread");
+                    }
                 } else if event_id == &log_messages_id {
                     // Show log window
                     info!("Log Messages clicked - showing window");

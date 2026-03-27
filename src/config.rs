@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use parking_lot::RwLock;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -18,6 +17,18 @@ use ipnet;
 pub struct ListenAddress {
     pub addr: String,
     pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum AclAction {
+    Permit,
+    Deny,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AclRule {
+    pub action: AclAction,
+    pub pattern: String,
 }
 
 impl Default for ListenAddress {
@@ -74,6 +85,8 @@ pub struct ForwardSpec {
     pub forward_type: ForwardType,
     pub gateway_host: Option<String>,
     pub gateway_port: u16,
+    pub gateway_username: Option<String>,
+    pub gateway_password: Option<String>,
     pub forward_host: Option<String>,
     pub forward_port: u16,
 }
@@ -220,15 +233,8 @@ impl Default for Action {
 pub struct UrlAction {
     pub patterns: Vec<String>,
     pub action: Action,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FilterRule {
-    pub pattern: String,
-    #[serde(skip)]
-    pub regex: Option<Regex>,
-    pub replacement: String,
-    pub enabled: bool,
+    pub file_name: String,
+    pub line_number: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,7 +243,6 @@ pub struct Config {
     pub forward_specs: Vec<ForwardSpec>,
     pub actions: Vec<Action>,
     pub url_actions: Vec<UrlAction>,
-    pub filter_rules: Vec<FilterRule>,
     #[serde(skip)]
     pub filters: Vec<crate::filter::Filter>,
     pub log_file: Option<PathBuf>,
@@ -246,15 +251,16 @@ pub struct Config {
     pub enable_remote_toggle: bool,
     pub enable_edit_actions: bool,
     pub buffer_limit: usize,
-    pub connection_timeout_secs: u64,
     pub keep_alive_timeout_secs: u64,
     pub max_client_connections: usize,
     pub trust_files: Vec<PathBuf>,
     pub actions_files: Vec<PathBuf>,
     pub filter_files: Vec<PathBuf>,
-    pub permit_access: Vec<String>,
-    pub deny_access: Vec<String>,
+    pub acl: Vec<AclRule>,
     pub forwarded_connect_retries: u32,
+    pub receive_buffer_size: usize,
+    pub socket_timeout: u64,
+    pub handle_as_empty_doc_returns_ok: bool,
     pub admin_address: Option<String>,
     pub proxy_info_url: Option<String>,
     pub user_manual: Option<String>,
@@ -282,6 +288,18 @@ pub struct Config {
     pub client_specific_tags: Vec<ClientSpecificTag>,
     pub accept_intercepted_requests: bool,
     pub client_tag_lifetime: u32,
+    pub ca_cert_file: Option<PathBuf>,
+    pub ca_key_file: Option<PathBuf>,
+    pub ca_directory: Option<PathBuf>,
+    pub ca_password: Option<String>,
+    pub certificate_directory: Option<PathBuf>,
+    pub trusted_cas_file: Option<PathBuf>,
+    pub cipher_list: Option<String>,
+    pub listen_backlog: i32,
+    pub default_server_timeout: u64,
+    pub connection_sharing: bool,
+    pub tolerate_pipelining: bool,
+    pub suppress_blocklists: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,7 +322,6 @@ impl Default for Config {
             forward_specs: Vec::new(),
             actions: Vec::new(),
             url_actions: Vec::new(),
-            filter_rules: Vec::new(),
             filters: Vec::new(),
             log_file: None,
             log_level: LOG_LEVEL_INFO | LOG_LEVEL_ERROR | LOG_LEVEL_FATAL,
@@ -312,15 +329,16 @@ impl Default for Config {
             enable_remote_toggle: true,
             enable_edit_actions: true,
             buffer_limit: 4096 * 1024, // 4MB
-            connection_timeout_secs: CONNECTION_TIMEOUT_SECS,
+            socket_timeout: CONNECTION_TIMEOUT_SECS,
             keep_alive_timeout_secs: KEEP_ALIVE_TIMEOUT_SECS,
             max_client_connections: MAX_CONNECTIONS,
             trust_files: Vec::new(),
             actions_files: Vec::new(),
             filter_files: Vec::new(),
-            permit_access: Vec::new(), // Deny all by default, matching C implementation
-            deny_access: Vec::new(),
+            acl: Vec::new(), // Deny all by default if NOT empty, matching C implementation
             forwarded_connect_retries: 0,
+            receive_buffer_size: 8192, // Default in C
+            handle_as_empty_doc_returns_ok: false,
             admin_address: None,
             proxy_info_url: Some(HOME_PAGE_URL.to_string()),
             user_manual: None,
@@ -345,6 +363,18 @@ impl Default for Config {
             client_specific_tags: Vec::new(),
             accept_intercepted_requests: false,
             client_tag_lifetime: 60, // Default to 60 seconds
+            ca_cert_file: None,
+            ca_key_file: None,
+            ca_directory: None,
+            ca_password: None,
+            certificate_directory: None,
+            trusted_cas_file: None,
+            cipher_list: None,
+            listen_backlog: 128,
+            default_server_timeout: 60,
+            connection_sharing: false,
+            tolerate_pipelining: true,
+            suppress_blocklists: false,
         }
     }
 }
@@ -466,6 +496,7 @@ impl Config {
 
     pub fn parse(content: &str) -> PrivoxyResult<Self> {
         let mut config = Config::default();
+        let mut first_listen = true;
 
         let reader = std::io::BufReader::new(content.as_bytes());
         let lines = crate::util::read_lines(reader);
@@ -483,6 +514,11 @@ impl Config {
 
                 match key {
                     "listen-address" => {
+                        // Clear the default listen address if it's the first one we're seeing
+                        if first_listen {
+                            config.listen_addresses.clear();
+                            first_listen = false;
+                        }
                         config.listen_addresses.extend(parse_listen_addresses(value)?);
                     }
                     "logfile" => {
@@ -506,6 +542,25 @@ impl Config {
                         config.max_client_connections = value.parse()
                             .map_err(|_| PrivoxyError::Config(format!("Invalid max connections: {}", value)))?;
                     }
+                    "socket-timeout" | "connection-timeout" => {
+                        config.socket_timeout = value.parse()
+                            .map_err(|_| PrivoxyError::Config(format!("Invalid timeout: {}", value)))?;
+                    }
+                    "keep-alive-timeout" => {
+                        config.keep_alive_timeout_secs = value.parse()
+                            .map_err(|_| PrivoxyError::Config(format!("Invalid keep-alive timeout: {}", value)))?;
+                    }
+                    "forwarded-connect-retries" => {
+                        config.forwarded_connect_retries = value.parse()
+                            .map_err(|_| PrivoxyError::Config(format!("Invalid forwarded connect retries: {}", value)))?;
+                    }
+                    "handle-as-empty-doc-returns-ok" => {
+                        config.handle_as_empty_doc_returns_ok = parse_bool(value)?;
+                    }
+                    "receive-buffer-size" => {
+                        config.receive_buffer_size = value.parse()
+                            .map_err(|_| PrivoxyError::Config(format!("Invalid receive buffer size: {}", value)))?;
+                    }
                     "actionsfile" => {
                         config.actions_files.push(PathBuf::from(value));
                     }
@@ -516,10 +571,16 @@ impl Config {
                         config.trust_files.push(PathBuf::from(value));
                     }
                     "permit-access" => {
-                        config.permit_access.push(value.to_string());
+                        config.acl.push(AclRule {
+                            action: AclAction::Permit,
+                            pattern: value.to_string(),
+                        });
                     }
                     "deny-access" => {
-                        config.deny_access.push(value.to_string());
+                        config.acl.push(AclRule {
+                            action: AclAction::Deny,
+                            pattern: value.to_string(),
+                        });
                     }
                     "admin-address" => {
                         config.admin_address = Some(value.to_string());
@@ -638,18 +699,6 @@ impl Config {
                     "log-file" => {
                         config.log_file = Some(PathBuf::from(value));
                     }
-                    "socket-timeout" | "connection-timeout" => {
-                        config.connection_timeout_secs = value.parse()
-                            .map_err(|_| PrivoxyError::Config(format!("Invalid timeout: {}", value)))?;
-                    }
-                    "keep-alive-timeout" => {
-                        config.keep_alive_timeout_secs = value.parse()
-                            .map_err(|_| PrivoxyError::Config(format!("Invalid keep-alive timeout: {}", value)))?;
-                    }
-                    "forwarded-connect-retries" => {
-                        config.forwarded_connect_retries = value.parse()
-                            .map_err(|_| PrivoxyError::Config(format!("Invalid retries: {}", value)))?;
-                    }
                     "header-order" => {
                         // Header ordering is handled during HTTP parsing
                         debug!("Header-order directive: {}", value);
@@ -665,6 +714,30 @@ impl Config {
                     "split-large-forms" => {
                         // Split large forms in CGI interface
                         debug!("Split-large-forms directive: {}", value);
+                    }
+                    "ca-cert-file" => config.ca_cert_file = Some(PathBuf::from(value)),
+                    "ca-key-file" => config.ca_key_file = Some(PathBuf::from(value)),
+                    "ca-directory" => config.ca_directory = Some(PathBuf::from(value)),
+                    "ca-password" => config.ca_password = Some(value.to_string()),
+                    "certificate-directory" => config.certificate_directory = Some(PathBuf::from(value)),
+                    "trusted-cas-file" => config.trusted_cas_file = Some(PathBuf::from(value)),
+                    "cipher-list" => config.cipher_list = Some(value.to_string()),
+                    "listen-backlog" => {
+                        config.listen_backlog = value.parse()
+                            .map_err(|_| PrivoxyError::Config(format!("Invalid listen-backlog: {}", value)))?;
+                    }
+                    "default-server-timeout" => {
+                        config.default_server_timeout = value.parse()
+                            .map_err(|_| PrivoxyError::Config(format!("Invalid default-server-timeout: {}", value)))?;
+                    }
+                    "connection-sharing" => {
+                        config.connection_sharing = parse_bool(value)?;
+                    }
+                    "tolerate-pipelining" => {
+                        config.tolerate_pipelining = parse_bool(value)?;
+                    }
+                    "suppress-blocklists" => {
+                        config.suppress_blocklists = parse_bool(value)?;
                     }
                     _ => {
                         warn!("Unknown configuration directive: {} {}", key, value);
@@ -698,33 +771,22 @@ impl Config {
         Ok(config)
     }
 
-    pub fn get_forward_spec(&self, host: &str, _port: u16) -> Option<&ForwardSpec> {
-        self.forward_specs.iter().find(|spec| {
-            matches_host_pattern(host, &spec.pattern)
-        })
-    }
 
     pub fn is_access_allowed(&self, addr: &str) -> bool {
-        // Check deny list first
-        for pattern in &self.deny_access {
-            if matches_pattern(addr, pattern) {
-                return false;
-            }
-        }
-
-        // If permit list is empty, allow all (unless specifically denied above)
-        if self.permit_access.is_empty() {
+        // If ACL is empty, default to permit all (for development) OR deny all (for security)?
+        // C-Privoxy defaults to deny all.
+        if self.acl.is_empty() {
             return true;
         }
 
-        // Then check permit list
-        for pattern in &self.permit_access {
-            if matches_pattern(addr, pattern) {
-                return true;
+        // Search the ACL in reverse order (last match wins)
+        for rule in self.acl.iter().rev() {
+            if matches_pattern(addr, &rule.pattern) {
+                return rule.action == AclAction::Permit;
             }
         }
 
-        // Default deny if permit list is not empty and no match was found
+        // Default deny if ACL is not empty and no match was found
         false
     }
     
@@ -742,6 +804,7 @@ impl Config {
         self.reload_requested || self.any_loaded_file_changed()
     }
     
+    #[allow(dead_code)]
     pub fn request_reload(&mut self) {
         self.reload_requested = true;
     }
@@ -809,16 +872,29 @@ fn parse_bool(value: &str) -> PrivoxyResult<bool> {
     }
 }
 
-fn parse_proxy_spec(proxy: &str, default_port: u16) -> PrivoxyResult<(String, u16)> {
+fn parse_proxy_spec(proxy: &str, default_port: u16) -> PrivoxyResult<(String, u16, Option<String>, Option<String>)> {
     if proxy == "." {
-        return Ok(("0.0.0.0".to_string(), 0));
+        return Ok(("0.0.0.0".to_string(), 0, None, None));
     }
-    if let Some((host, port_str)) = proxy.rsplit_once(':') {
+
+    let mut auth = (None, None);
+    let host_part = if let Some((user_pass, host_port)) = proxy.split_once('@') {
+        if let Some((user, pass)) = user_pass.split_once(':') {
+            auth = (Some(user.to_string()), Some(pass.to_string()));
+        } else {
+            auth = (Some(user_pass.to_string()), None);
+        }
+        host_port
+    } else {
+        proxy
+    };
+
+    if let Some((host, port_str)) = host_part.rsplit_once(':') {
         let port = port_str.parse()
             .map_err(|_| PrivoxyError::Config(format!("Invalid proxy port: {}", port_str)))?;
-        Ok((host.to_string(), port))
+        Ok((host.to_string(), port, auth.0, auth.1))
     } else {
-        Ok((proxy.to_string(), default_port))
+        Ok((host_part.to_string(), default_port, auth.0, auth.1))
     }
 }
 
@@ -838,6 +914,8 @@ fn parse_forward_spec(value: &str, forward_type: ForwardType) -> PrivoxyResult<O
         forward_type,
         gateway_host: None,
         gateway_port: 0,
+        gateway_username: None,
+        gateway_password: None,
         forward_host: None,
         forward_port: 0,
     };
@@ -846,7 +924,7 @@ fn parse_forward_spec(value: &str, forward_type: ForwardType) -> PrivoxyResult<O
         ForwardType::Direct | ForwardType::ForwardWebserver | ForwardType::Http => {
             // forward pattern (.|http-proxy)
             if parts.len() >= 2 {
-                let (host, port) = parse_proxy_spec(parts[1], 8000)?;
+                let (host, port, _user, _pass) = parse_proxy_spec(parts[1], 8000)?;
                 if host != "0.0.0.0" {
                     spec.forward_host = Some(host);
                     spec.forward_port = port;
@@ -856,14 +934,16 @@ fn parse_forward_spec(value: &str, forward_type: ForwardType) -> PrivoxyResult<O
         ForwardType::Socks4 | ForwardType::Socks4a | ForwardType::Socks5 | ForwardType::Socks5t => {
             // forward-socks5 pattern socks-proxy [http-proxy]
             if parts.len() >= 2 {
-                let (host, port) = parse_proxy_spec(parts[1], 1080)?;
+                let (host, port, user, pass) = parse_proxy_spec(parts[1], 1080)?;
                 if host != "0.0.0.0" {
                     spec.gateway_host = Some(host);
                     spec.gateway_port = port;
+                    spec.gateway_username = user;
+                    spec.gateway_password = pass;
                 }
             }
             if parts.len() >= 3 {
-                let (host, port) = parse_proxy_spec(parts[2], 8000)?;
+                let (host, port, _user, _pass) = parse_proxy_spec(parts[2], 8000)?;
                 if host != "0.0.0.0" {
                     spec.forward_host = Some(host);
                     spec.forward_port = port;
@@ -1003,8 +1083,8 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
-        // C implementation defaults to NO ACLs (all permitted)
-        assert!(config.permit_access.is_empty());
+        // C implementation defaults to NO ACLs (permit all for compatibility)
+        assert!(config.acl.is_empty());
         assert!(config.is_access_allowed("127.0.0.1"));
         assert_eq!(config.listen_addresses.len(), 1);
         assert_eq!(config.listen_addresses[0].port, 8118);
@@ -1014,17 +1094,17 @@ mod tests {
     fn test_is_access_allowed() {
         let mut config = Config::default();
         
-        // Default: empty permit/deny lists should allow all
+        // Default: empty ACL should allow all (matching C behavior)
         assert!(config.is_access_allowed("127.0.0.1"));
         assert!(config.is_access_allowed("192.168.1.1"));
 
-        // Only permit 127.0.0.1
-        config.permit_access.push("127.0.0.1".to_string());
+        // Permit 127.0.0.1 (ACL not empty anymore)
+        config.acl.push(AclRule { action: AclAction::Permit, pattern: "127.0.0.1".to_string() });
         assert!(config.is_access_allowed("127.0.0.1"));
         assert!(!config.is_access_allowed("192.168.1.1"));
 
-        // Deny 127.0.0.1 even if permitted
-        config.deny_access.push("127.0.0.1".to_string());
+        // Deny 127.0.0.1 (last match wins)
+        config.acl.push(AclRule { action: AclAction::Deny, pattern: "127.0.0.1".to_string() });
         assert!(!config.is_access_allowed("127.0.0.1"));
     }
 
@@ -1048,18 +1128,20 @@ forward-socks5 .onion 127.0.0.1:9050 .
         assert_ne!(config.log_level & LOG_LEVEL_REQUEST, 0);
         assert_ne!(config.log_level & LOG_LEVEL_CONNECT, 0);
         
-        // Multiple listeners (1 default + 2 from config)
-        assert_eq!(config.listen_addresses.len(), 3);
-        assert_eq!(config.listen_addresses[1].port, 8118);
-        assert_eq!(config.listen_addresses[2].port, 8119);
+        // Multiple listeners (overrides default, so just 2 from config)
+        assert_eq!(config.listen_addresses.len(), 2);
+        assert_eq!(config.listen_addresses[0].port, 8118);
+        assert_eq!(config.listen_addresses[1].port, 8119);
         
         // Forward pattern order (pattern first, then proxy)
-        let fwd = config.get_forward_spec("test.example.com", 80).expect("Should have forward spec");
+        let fwd = config.forward_specs.iter().find(|s| matches_host_pattern("test.example.com", &s.pattern))
+            .expect("Should have forward spec");
         assert_eq!(fwd.forward_host.as_deref(), Some("127.0.0.1"));
         assert_eq!(fwd.forward_port, 8080);
         assert!(fwd.gateway_host.is_none());
         
-        let socks_fwd = config.get_forward_spec("something.onion", 80).expect("Should have socks forward spec");
+        let socks_fwd = config.forward_specs.iter().find(|s| matches_host_pattern("something.onion", &s.pattern))
+            .expect("Should have socks forward spec");
         assert_eq!(socks_fwd.gateway_host.as_deref(), Some("127.0.0.1"));
         assert_eq!(socks_fwd.gateway_port, 9050);
         assert_eq!(socks_fwd.forward_type, ForwardType::Socks5);
@@ -1080,5 +1162,21 @@ forward-socks5 .onion 127.0.0.1:9050 .
         assert!(parse_bool("1").unwrap());
         assert!(!parse_bool("no").unwrap());
         assert!(!parse_bool("0").unwrap());
+    }
+
+    #[test]
+    fn test_timeout_and_retries() {
+        let config_text = r#"
+socket-timeout 30
+connection-timeout 60
+keep-alive-timeout 15
+forwarded-connect-retries 3
+"#;
+        let config = Config::parse(config_text).unwrap();
+        // The last one wins if they map to the same field, or they map to different fields.
+        // In our implementation "socket-timeout" and "connection-timeout" both map to socket_timeout.
+        assert_eq!(config.socket_timeout, 60);
+        assert_eq!(config.keep_alive_timeout_secs, 15);
+        assert_eq!(config.forwarded_connect_retries, 3);
     }
 }

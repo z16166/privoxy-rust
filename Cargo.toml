@@ -44,10 +44,10 @@ connection-sharing = []
 fuzz = []
 
 # Windows-specific features
-windows-service = ["dep:windows-service", "dep:windows"]
+windows-service = ["dep:windows-service"]
 
 # Tray icon (cross-platform)
-tray-icon = ["dep:tray-icon", "dep:winit", "dep:rfd", "dep:libui", "dep:windows"]
+tray-icon = ["dep:tray-icon", "dep:winit", "dep:rfd", "dep:libui"]
 
 # Default features
 default = ["rustls", "compression", "toggle", "force-load", "fast-redirects", "statistics", "image-blocking", "acl", "trust", "cgi-edit-actions", "connection-keep-alive", "connection-sharing", "client-tags"]
@@ -58,7 +58,7 @@ default = ["rustls", "compression", "toggle", "force-load", "fast-redirects", "s
 tokio = { version = "1.44", features = ["full"] }
 clap = { version = "4.5", features = ["derive"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "time", "local-time", "chrono", "fmt"] }
 anyhow = "1.0"
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
@@ -97,7 +97,6 @@ http-body-util = { version = "0.1", optional = true }
 
 # Windows service
 windows-service = { version = "0.7", optional = true }
-windows = { version = "0.58", optional = true, features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Networking_WinSock"] }
 
 # Tray icon
 tray-icon = { version = "0.19", optional = true }
@@ -122,5 +121,8 @@ debug = true
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Networking_WinSock", "Win32_System_Console"] }
 
 

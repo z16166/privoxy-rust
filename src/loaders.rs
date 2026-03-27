@@ -93,11 +93,14 @@ impl ActionsFile {
         let mut current_action = Action::default();
         let mut in_action_block = false;
 
+        let mut line_number = 0;
+        let mut section_start_line = 0;
         let lines = crate::util::read_lines(reader);
         for line in lines {
+            line_number += 1;
             let line = line.trim();
 
-            if line.is_empty() {
+            if line.is_empty() || line.starts_with('#') {
                 continue;
             }
 
@@ -105,6 +108,7 @@ impl ActionsFile {
             if line.starts_with('{') && line.ends_with('}') {
                 current_action = Action::default();
                 in_action_block = true;
+                section_start_line = line_number;
 
                 // Parse actions in the block
                 let actions_str = &line[1..line.len() - 1];
@@ -117,6 +121,8 @@ impl ActionsFile {
                 url_actions.push(UrlAction {
                     patterns: vec![line.to_string()],
                     action: current_action.clone(),
+                    file_name: filename.to_string_lossy().to_string(),
+                    line_number: section_start_line,
                 });
             }
         }
@@ -198,7 +204,7 @@ impl TrustFile {
     }
 }
 
-fn parse_action_string(actions_str: &str, action: &mut Action) -> PrivoxyResult<()> {
+pub(crate) fn parse_action_string(actions_str: &str, action: &mut Action) -> PrivoxyResult<()> {
     // Don't remove outer braces - the input may or may not have them
     let content = actions_str.trim();
     
@@ -457,6 +463,8 @@ pub fn parse_forward_directive(line: &str) -> PrivoxyResult<Option<ForwardSpec>>
         forward_type,
         gateway_host: None,
         gateway_port: 0,
+        gateway_username: None,
+        gateway_password: None,
         forward_host: None,
         forward_port: 0,
     };
@@ -467,7 +475,7 @@ pub fn parse_forward_directive(line: &str) -> PrivoxyResult<Option<ForwardSpec>>
             if parts.len() < 2 {
                 return Ok(None);
             }
-            let (host, port) = parse_host_port(parts[1])?;
+            let (host, port, _user, _pass) = parse_host_port(parts[1])?;
             if host != "0.0.0.0" {
                 spec.forward_host = Some(host);
                 spec.forward_port = port;
@@ -478,14 +486,16 @@ pub fn parse_forward_directive(line: &str) -> PrivoxyResult<Option<ForwardSpec>>
             if parts.len() < 2 {
                 return Ok(None);
             }
-            let (host, port) = parse_host_port(parts[1])?;
+            let (host, port, user, pass) = parse_host_port(parts[1])?;
             if host != "0.0.0.0" {
                 spec.gateway_host = Some(host);
                 spec.gateway_port = port;
+                spec.gateway_username = user;
+                spec.gateway_password = pass;
             }
             
             if parts.len() >= 3 {
-                let (host, port) = parse_host_port(parts[2])?;
+                let (host, port, _user, _pass) = parse_host_port(parts[2])?;
                 if host != "0.0.0.0" {
                     spec.forward_host = Some(host);
                     spec.forward_port = port;
@@ -497,17 +507,30 @@ pub fn parse_forward_directive(line: &str) -> PrivoxyResult<Option<ForwardSpec>>
     Ok(Some(spec))
 }
 
-fn parse_host_port(host_port: &str) -> PrivoxyResult<(String, u16)> {
+fn parse_host_port(host_port: &str) -> PrivoxyResult<(String, u16, Option<String>, Option<String>)> {
     if host_port == "." {
-        return Ok(("0.0.0.0".to_string(), 0));
+        return Ok(("0.0.0.0".to_string(), 0, None, None));
     }
-    if let Some((host, port_str)) = host_port.rsplit_once(':') {
+
+    let mut auth = (None, None);
+    let host_part = if let Some((user_pass, host_port)) = host_port.split_once('@') {
+        if let Some((user, pass)) = user_pass.split_once(':') {
+            auth = (Some(user.to_string()), Some(pass.to_string()));
+        } else {
+            auth = (Some(user_pass.to_string()), None);
+        }
+        host_port
+    } else {
+        host_port
+    };
+
+    if let Some((host, port_str)) = host_part.rsplit_once(':') {
         let port: u16 = port_str.parse()
             .map_err(|_| PrivoxyError::Config(format!("Invalid port number: {}", port_str)))?;
-        Ok((host.to_string(), port))
+        Ok((host.to_string(), port, auth.0, auth.1))
     } else {
         // Default port can be 0 or a logical default; caller handles specific defaults
-        Ok((host_port.to_string(), 0))
+        Ok((host_part.to_string(), 0, auth.0, auth.1))
     }
 }
 
@@ -612,7 +635,7 @@ mod tests {
         // Modify the file
         fs::write(&temp_file, "{+block} modified.com").unwrap();
         // Use a longer sleep to ensure filesystem mtime updates (some OS have 1s resolution)
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(3100));
         
         assert!(file_list.has_been_modified());
         
@@ -657,7 +680,7 @@ blocked.com
         
         // File has changed
         fs::write(&temp_file, "{+block} modified.com").unwrap();
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(3100));
         
         let result = FileList::check_file_changed(Some(&file_list), &temp_file).unwrap();
         assert!(result.is_some());
