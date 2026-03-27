@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![windows_subsystem = "windows"]
 
 use anyhow::Result;
 use clap::Parser;
@@ -45,7 +45,7 @@ mod windows_service;
 mod tray_icon;
 
 use crate::config::{Config, ConfigRef};
-use crate::logger::init_logging;
+
 use crate::server::ProxyServer;
 
 const VERSION: &str = "4.1.0";
@@ -123,16 +123,27 @@ async fn main() -> Result<()> {
     } else {
         "info"
     };
+    
+    // If tray-icon feature is enabled, we initialize with GUI support (cache will be linked later)
+    #[cfg(feature = "tray-icon")]
+    crate::logger::init_logging_with_gui(log_level, None, 1000)?;
+    
+    #[cfg(not(feature = "tray-icon"))]
     init_logging(log_level)?;
 
     info!("Privoxy version {} ({}) starting...", VERSION, CODE_STATUS);
     info!("Home page: {}", HOME_PAGE_URL);
 
     // Load configuration
-    let config = Arc::new(RwLock::new(
-        Config::load(&cli.config_file)
-            .map_err(|e| anyhow::anyhow!("Failed to load config from {:?}: {}", cli.config_file, e))?
-    ));
+    let config_val = Config::load(&cli.config_file)
+        .map_err(|e| anyhow::anyhow!("Failed to load config from {:?}: {}", cli.config_file, e))?;
+    
+    // Late-bind log file if specified in config
+    if let Some(log_file) = &config_val.log_file {
+        crate::logger::update_log_file(log_file)?;
+    }
+
+    let config = Arc::new(RwLock::new(config_val));
 
     // Test configuration if requested
     if cli.config_test {
@@ -236,6 +247,11 @@ async fn main() -> Result<()> {
                             info!("Shutdown signal received, stopping server...");
                         }
                     }
+                    
+                    // Force the entire process to exit after server shutdown
+                    // This handles the case where the main thread is blocking on a GUI event loop (tray icon)
+                    info!("Privoxy background server stopped, exiting process...");
+                    std::process::exit(0);
                 });
             });
             

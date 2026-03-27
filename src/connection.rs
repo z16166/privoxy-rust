@@ -6,7 +6,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tokio_socks::tcp::socks5::Socks5Stream;
+// use tokio_socks::tcp::socks5::Socks5Stream;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::action::{
@@ -25,7 +25,6 @@ use crate::action::{
 use crate::action::deanimate_gif;
 use crate::compression::decompress;
 use crate::config::ConfigRef;
-use crate::constants::*;
 use crate::error::{PrivoxyError, PrivoxyResult};
 use crate::filter::FilterVariables;
 use crate::http::{HttpRequest, HttpResponse, create_connect_response, create_error_response};
@@ -42,11 +41,12 @@ pub struct ConnectionHandler {
 
 impl ConnectionHandler {
     pub fn new(client_stream: TcpStream, client_addr: SocketAddr, config: ConfigRef) -> Self {
+        let buffer_size = config.read().receive_buffer_size;
         Self {
             client_stream,
             client_addr,
             server_stream: None,
-            buffer: BytesMut::with_capacity(BUFFER_SIZE),
+            buffer: BytesMut::with_capacity(buffer_size),
             config,
         }
     }
@@ -73,11 +73,13 @@ impl ConnectionHandler {
     }
 
     async fn read_request(&mut self) -> PrivoxyResult<Option<HttpRequest>> {
-        let mut temp_buffer = vec![0u8; BUFFER_SIZE];
+        let buffer_size = self.config.read().receive_buffer_size;
+        let mut temp_buffer = vec![0u8; buffer_size];
 
+        let timeout_secs = self.config.read().socket_timeout;
         loop {
             match timeout(
-                Duration::from_secs(CONNECTION_TIMEOUT_SECS),
+                Duration::from_secs(timeout_secs),
                 self.client_stream.read(&mut temp_buffer)
             ).await {
                 Ok(Ok(0)) => {
@@ -131,6 +133,8 @@ impl ConnectionHandler {
                                     forward_type: crate::config::ForwardType::Direct,
                                     gateway_host: None,
                                     gateway_port: 0,
+                                    gateway_username: None,
+                                    gateway_password: None,
                                     forward_host: None,
                                     forward_port: 0,
                                 };
@@ -189,6 +193,8 @@ impl ConnectionHandler {
                 forward_type: crate::config::ForwardType::Direct,
                 gateway_host: None,
                 gateway_port: 0,
+                gateway_username: None,
+                gateway_password: None,
                 forward_host: None,
                 forward_port: 0,
             }
@@ -198,7 +204,7 @@ impl ConnectionHandler {
         
         let (timeout_secs, retries) = {
             let config = self.config.read();
-            (config.connection_timeout_secs, config.forwarded_connect_retries)
+            (config.socket_timeout, config.forwarded_connect_retries)
         };
 
         let mut last_error = None;
@@ -231,12 +237,25 @@ impl ConnectionHandler {
                     
                     match forward_spec_clone.forward_type {
                         crate::config::ForwardType::Socks5 | crate::config::ForwardType::Socks5t => {
-                            let socks_stream = Socks5Stream::connect_with_socket(tcp_stream, next_hop.as_str())
-                                .await
-                                .map_err(|e| PrivoxyError::Connection(
-                                    format!("SOCKS5 connect failed: {:?}", e)
-                                ))?;
-                            Ok(socks_stream.into_inner())
+                            if let (Some(u), Some(p)) = (forward_spec_clone.gateway_username, forward_spec_clone.gateway_password) {
+                                // Connect with authentication
+                                let socks_stream = tokio_socks::tcp::socks5::Socks5Stream::connect_with_password(
+                                    gateway_addr.as_str(),
+                                    next_hop.as_str(),
+                                    &u,
+                                    &p
+                                ).await.map_err(|e| PrivoxyError::Connection(format!("SOCKS5 connect with auth failed: {:?}", e)))?;
+                                
+                                Ok(socks_stream.into_inner())
+                            } else {
+                                // Connect without authentication
+                                let socks_stream = tokio_socks::tcp::socks5::Socks5Stream::connect(
+                                    gateway_addr.as_str(),
+                                    next_hop.as_str()
+                                ).await.map_err(|e| PrivoxyError::Connection(format!("SOCKS5 connect failed: {:?}", e)))?;
+                                
+                                Ok(socks_stream.into_inner())
+                            }
                         }
                         crate::config::ForwardType::Socks4 | crate::config::ForwardType::Socks4a => {
                             let socks_stream = tokio_socks::tcp::socks4::Socks4Stream::connect_with_socket(
@@ -347,7 +366,13 @@ impl ConnectionHandler {
                 let response = if a.handle_as_image {
                     create_blocked_image_response()
                 } else if a.handle_as_empty_document {
-                    create_empty_document_response()
+                    let config = self.config.read();
+                    let (code, text) = if config.handle_as_empty_doc_returns_ok {
+                        (200, "OK")
+                    } else {
+                        (403, "Forbidden")
+                    };
+                    create_empty_document_response(code, text)
                 } else {
                     create_blocked_page_response(&url, reason)
                 };
@@ -432,12 +457,14 @@ impl ConnectionHandler {
     }
 
     async fn forward_response(&mut self, server_stream: &mut TcpStream, url: &str, action_ctx: &mut ActionContext, action: Option<&crate::config::Action>) -> PrivoxyResult<()> {
-        let mut buffer = vec![0u8; BUFFER_SIZE];
+        let buffer_size = self.config.read().receive_buffer_size;
+        let mut buffer = vec![0u8; buffer_size];
         let mut response_data = BytesMut::new();
 
+        let timeout_secs = self.config.read().socket_timeout;
         loop {
             match timeout(
-                Duration::from_secs(CONNECTION_TIMEOUT_SECS),
+                Duration::from_secs(timeout_secs),
                 server_stream.read(&mut buffer)
             ).await {
                 Ok(Ok(0)) => break,
@@ -461,7 +488,39 @@ impl ConnectionHandler {
             }
         };
 
-        if let Some(content_encoding) = response.headers.get("Content-Encoding") {
+        // Determine if we need to buffer the whole body for filtering/tagging
+        let mut needs_body = false;
+        if let Some(a) = action {
+            if a.filter || !a.filter_names.is_empty() || !a.client_body_tagger_names.is_empty() || !a.client_body_filter_names.is_empty() {
+                needs_body = true;
+            }
+            if a.deanimate_gifs.is_some() {
+                needs_body = true;
+            }
+        }
+
+        if needs_body {
+            // Read until the end of the body
+            let body_already_read = if response_data.len() > response.header_length() {
+                &response_data[response.header_length()..]
+            } else {
+                &[]
+            };
+            
+            match self.read_full_body(server_stream, &response, body_already_read).await {
+                Ok(full_body) => {
+                    response.body = full_body;
+                    response.remove_header("Transfer-Encoding");
+                    response.set_header("Content-Length".to_string(), response.body.len().to_string());
+                }
+                Err(e) => {
+                    warn!("Failed to read full body for filtering: {}", e);
+                    // Continue with whatever we have, or fallback to streaming if possible
+                }
+            }
+        }
+
+        if let Some(content_encoding) = response.get_header("Content-Encoding") {
             let compression = if content_encoding == "gzip" {
                 Some(crate::compression::CompressionAlgorithm::Gzip)
             } else if content_encoding == "deflate" {
@@ -475,8 +534,8 @@ impl ConnectionHandler {
                     match decompress(&response.body, alg) {
                         Ok(decompressed) => {
                             response.body = decompressed.to_vec();
-                            response.headers.remove("Content-Encoding");
-                            response.headers.insert("Content-Length".to_string(), response.body.len().to_string());
+                            response.remove_header("Content-Encoding");
+                            response.set_header("Content-Length".to_string(), response.body.len().to_string());
                             debug!("Decompressed response body");
                         }
                         Err(e) => {
@@ -496,14 +555,14 @@ impl ConnectionHandler {
                 let delay_ms = a.delay_response;
                 
                 if let Some(ref mode) = deanimate_mode {
-                    let content_type = response.headers.get("Content-Type")
+                    let content_type = response.get_header("Content-Type")
                         .map(|s| s.to_lowercase())
                         .unwrap_or_default();
                     
                     if content_type.contains("image/gif") || response.body.starts_with(b"GIF") {
                         if let Some(deanimated) = deanimate_gif(&response.body, mode) {
                             response.body = deanimated;
-                            response.headers.insert("Content-Length".to_string(), response.body.len().to_string());
+                            response.set_header("Content-Length".to_string(), response.body.len().to_string());
                             debug!("GIF deanimated");
                         }
                     }
@@ -537,7 +596,7 @@ impl ConnectionHandler {
             return;
         }
 
-        let content_type = match response.headers.get("Content-Type") {
+        let content_type = match response.get_header("Content-Type") {
             Some(ct) => ct.to_lowercase(),
             None => return,
         };
@@ -632,7 +691,7 @@ impl ConnectionHandler {
         
         if let Some(ref mode) = action.fast_redirects {
             if response.status_code >= 300 && response.status_code < 400 {
-                if let Some(location) = response.headers.get("Location").cloned() {
+                if let Some(location) = response.get_header("Location").cloned() {
                     if let Some(decoded_location) = apply_fast_redirects(response.status_code, Some(&location), mode) {
                         debug!("Fast redirect: {} -> {}", location, decoded_location);
                     }
@@ -645,20 +704,22 @@ impl ConnectionHandler {
                 if blocker != "blank" && blocker != "pattern" {
                     response.status_code = 302;
                     response.status_text = "Found".to_string();
-                    response.headers.insert("Location".to_string(), blocker.clone());
+                    response.set_header("Location".to_string(), blocker.clone());
                     response.body.clear();
-                    response.headers.insert("Content-Length".to_string(), "0".to_string());
+                    response.set_header("Content-Length".to_string(), "0".to_string());
                 }
             }
         }
     }
 
     async fn forward_remaining(&mut self, server_stream: &mut TcpStream) -> PrivoxyResult<()> {
-        let mut buffer = vec![0u8; BUFFER_SIZE];
+        let buffer_size = self.config.read().receive_buffer_size;
+        let mut buffer = vec![0u8; buffer_size];
 
+        let timeout_secs = self.config.read().socket_timeout;
         loop {
             match timeout(
-                Duration::from_secs(CONNECTION_TIMEOUT_SECS),
+                Duration::from_secs(timeout_secs),
                 server_stream.read(&mut buffer)
             ).await {
                 Ok(Ok(0)) => break,
@@ -671,6 +732,104 @@ impl ConnectionHandler {
         }
 
         Ok(())
+    }
+
+    async fn read_full_body(&self, server_stream: &mut TcpStream, resp: &HttpResponse, initial: &[u8]) -> PrivoxyResult<Vec<u8>> {
+        let mut body = initial.to_vec();
+        
+        let is_chunked = resp.get_header("Transfer-Encoding")
+            .map(|s| s.eq_ignore_ascii_case("chunked"))
+            .unwrap_or(false);
+            
+        let content_length = resp.get_header("Content-Length")
+            .and_then(|s| s.parse::<usize>().ok());
+
+        if is_chunked {
+            return self.read_chunked_body(server_stream, &mut body).await;
+        }
+
+        if let Some(len) = content_length {
+            while body.len() < len {
+                let mut buffer = vec![0u8; len - body.len()];
+                let timeout_secs = self.config.read().socket_timeout;
+                match timeout(Duration::from_secs(timeout_secs), server_stream.read(&mut buffer)).await {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => body.extend_from_slice(&buffer[..n]),
+                    Ok(Err(e)) => return Err(PrivoxyError::Io(e)),
+                    Err(_) => return Err(PrivoxyError::Timeout),
+                }
+            }
+        } else {
+            // Read until EOF
+            let buffer_size = self.config.read().receive_buffer_size;
+            let mut buffer = vec![0u8; buffer_size];
+            let timeout_secs = self.config.read().socket_timeout;
+            loop {
+                match timeout(Duration::from_secs(timeout_secs), server_stream.read(&mut buffer)).await {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => body.extend_from_slice(&buffer[..n]),
+                    Ok(Err(e)) => return Err(PrivoxyError::Io(e)),
+                    Err(_) => return Err(PrivoxyError::Timeout),
+                }
+            }
+        }
+        
+        Ok(body)
+    }
+
+    async fn read_chunked_body(&self, server_stream: &mut TcpStream, buffer: &mut Vec<u8>) -> PrivoxyResult<Vec<u8>> {
+        let mut dechunked = Vec::new();
+        let mut pos = 0;
+        
+        loop {
+            // Wait for chunk size line
+            while !buffer[pos..].windows(2).any(|w| w == b"\r\n") {
+                let mut read_buf = vec![0u8; 1024];
+                let timeout_secs = self.config.read().socket_timeout;
+                match timeout(Duration::from_secs(timeout_secs), server_stream.read(&mut read_buf)).await {
+                    Ok(Ok(0)) => return Err(PrivoxyError::Http("Unexpected EOF in chunked body".to_string())),
+                    Ok(Ok(n)) => buffer.extend_from_slice(&read_buf[..n]),
+                    Ok(Err(e)) => return Err(PrivoxyError::Io(e)),
+                    Err(_) => return Err(PrivoxyError::Timeout),
+                }
+            }
+            
+            // Parse chunk size (handling optional extensions after ;)
+            let line_end = buffer[pos..].windows(2).position(|w| w == b"\r\n").unwrap() + pos;
+            let line = &buffer[pos..line_end];
+            let size_part = if let Some(semi_pos) = line.iter().position(|&b| b == b';') {
+                &line[..semi_pos]
+            } else {
+                line
+            };
+            
+            let size_str = std::str::from_utf8(size_part).unwrap_or("0").trim();
+            let chunk_size = usize::from_str_radix(size_str, 16)
+                .map_err(|_| PrivoxyError::Http(format!("Invalid chunk size: '{}'", size_str)))?;
+            
+            pos = line_end + 2;
+            
+            if chunk_size == 0 {
+                break; // End of chunks
+            }
+            
+            // Read chunk data
+            while buffer.len() < pos + chunk_size + 2 {
+                let mut read_buf = vec![0u8; pos + chunk_size + 2 - buffer.len()];
+                let timeout_secs = self.config.read().socket_timeout;
+                match timeout(Duration::from_secs(timeout_secs), server_stream.read(&mut read_buf)).await {
+                    Ok(Ok(0)) => return Err(PrivoxyError::Http("Unexpected EOF in chunked data".to_string())),
+                    Ok(Ok(n)) => buffer.extend_from_slice(&read_buf[..n]),
+                    Ok(Err(e)) => return Err(PrivoxyError::Io(e)),
+                    Err(_) => return Err(PrivoxyError::Timeout),
+                }
+            }
+            
+            dechunked.extend_from_slice(&buffer[pos..pos + chunk_size]);
+            pos += chunk_size + 2;
+        }
+        
+        Ok(dechunked)
     }
 
     async fn run_tunnel(&mut self) -> PrivoxyResult<()> {
@@ -704,5 +863,18 @@ fn normalize_request_path(path: &str) -> &str {
     match rest.find('/') {
         Some(i) => &rest[i..],
         None => "/",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_request_path() {
+        assert_eq!(normalize_request_path("http://example.com/path"), "/path");
+        assert_eq!(normalize_request_path("https://example.com/path?query"), "/path?query");
+        assert_eq!(normalize_request_path("http://example.com"), "/");
+        assert_eq!(normalize_request_path("/local/path"), "/local/path");
     }
 }

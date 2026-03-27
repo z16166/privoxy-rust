@@ -17,41 +17,7 @@ pub fn current_timestamp_millis() -> u128 {
         .as_millis()
 }
 
-/// Enable ANSI escape code support on Windows consoles.
-/// This enables Virtual Terminal Processing (VT100 support).
-#[cfg(windows)]
-pub fn enable_ansi_support() {
-    use windows::Win32::System::Console::{
-        GetConsoleMode, GetStdHandle, SetConsoleMode, CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-        STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
-    };
 
-    unsafe {
-        // Enable for stdout
-        if let Ok(handle) = GetStdHandle(STD_OUTPUT_HANDLE) {
-            if !handle.is_invalid() {
-                let mut mode = CONSOLE_MODE::default();
-                if GetConsoleMode(handle, &mut mode).is_ok() {
-                    let _ = SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-                }
-            }
-        }
-        
-        // Enable for stderr (where tracing usually writes)
-        if let Ok(handle) = GetStdHandle(STD_ERROR_HANDLE) {
-            if !handle.is_invalid() {
-                let mut mode = CONSOLE_MODE::default();
-                if GetConsoleMode(handle, &mut mode).is_ok() {
-                    let _ = SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-                }
-            }
-        }
-    }
-}
-
-/// Fallback for non-Windows platforms.
-#[cfg(not(windows))]
-pub fn enable_ansi_support() {}
 
 pub fn format_timestamp(timestamp: u64) -> String {
     let datetime = chrono::DateTime::from_timestamp(timestamp as i64, 0)

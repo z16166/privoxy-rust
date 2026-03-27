@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Feature flags for Privoxy
 //! These are controlled via Cargo features, similar to how autoconf controls C preprocessor macros
 

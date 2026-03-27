@@ -1,9 +1,11 @@
 #![allow(dead_code)]
-
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::Path;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
-use tracing::{Level, Metadata};
+use tracing::{Level, Metadata, Event, subscriber::Interest};
 
 use crate::errlog;
 use crate::error::PrivoxyResult;
@@ -20,13 +22,16 @@ use parking_lot::RwLock;
 #[cfg(feature = "tray-icon")]
 static GUI_LOG_CACHE_REGISTRY: Lazy<RwLock<Option<LogCache>>> = Lazy::new(|| RwLock::new(None));
 
+/// Global registry for the log file handle to allow late-binding
+static GUI_LOG_FILE_REGISTRY: Lazy<RwLock<Option<Arc<parking_lot::Mutex<File>>>>> = Lazy::new(|| RwLock::new(None));
+
 /// UI handle and log textarea handle for real-time updates
 #[cfg(feature = "tray-icon")]
 #[derive(Clone)]
 pub struct UiLogHandles {
-    pub ui: libui::UI,
-    pub window: libui::controls::Window,
-    pub log_textarea: libui::controls::MultilineEntry,
+    pub event_queue: Arc<libui::EventQueue>,
+    pub window: Option<libui::controls::Window>,
+    pub log_textarea: Option<libui::controls::MultilineEntry>,
 }
 
 #[cfg(feature = "tray-icon")]
@@ -40,9 +45,10 @@ pub type LogCache = Arc<std::sync::Mutex<(Vec<String>, Option<UiLogHandles>)>>;
 #[cfg(not(feature = "tray-icon"))]
 pub type LogCache = Arc<std::sync::Mutex<Vec<String>>>;
 
-/// Custom layer that writes log messages to both stderr and GUI cache
+/// Custom layer that writes log messages to both file and GUI cache (unified logging)
 pub struct GuiLogLayer {
     log_cache: Option<LogCache>,
+    log_file: Option<Arc<parking_lot::Mutex<File>>>,
     max_buffer_lines: usize,
 }
 
@@ -50,6 +56,7 @@ impl GuiLogLayer {
     pub fn new(log_cache: Option<LogCache>, max_buffer_lines: usize) -> Self {
         Self {
             log_cache,
+            log_file: None,
             max_buffer_lines,
         }
     }
@@ -63,61 +70,80 @@ where
         metadata.target().starts_with("privoxy") || metadata.target().starts_with("privoxy_rust")
     }
 
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+    fn register_callsite(&self, _metadata: &Metadata<'_>) -> Interest {
+        Interest::always()
+    }
+
+    fn on_event(&self, event: &Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
         // Use either the provided cache or the global registry
         #[cfg(feature = "tray-icon")]
         let log_cache_opt = self.log_cache.clone().or_else(|| GUI_LOG_CACHE_REGISTRY.read().clone());
         #[cfg(not(feature = "tray-icon"))]
         let log_cache_opt = self.log_cache.clone();
 
+        // Use global file registry if not provided (usually not provided in constructor as it's late-bound)
+        let log_file_opt = self.log_file.clone().or_else(|| GUI_LOG_FILE_REGISTRY.read().clone());
+
+        // Extract message
+        let mut visitor = StringVisitor::new();
+        event.record(&mut visitor);
+        
+        let level = match *event.metadata().level() {
+            Level::ERROR => "ERROR",
+            Level::WARN => "WARN",
+            Level::INFO => "INFO",
+            Level::DEBUG => "DEBUG",
+            Level::TRACE => "TRACE",
+        };
+        
+        let now = chrono::Local::now();
+        let timestamp = now.format("%Y-%m-%dT%H:%M:%S%.3f%:z");
+        let formatted_message = format!("{} {}: {}", timestamp, level, visitor.string);
+
+        // 1. Write to memory cache (and UI if handles are available)
         if let Some(ref log_cache) = log_cache_opt {
-            let mut visitor = StringVisitor::new();
-            event.record(&mut visitor);
-            
-            let level = match *event.metadata().level() {
-                Level::ERROR => "ERROR",
-                Level::WARN => "WARN",
-                Level::INFO => "INFO",
-                Level::DEBUG => "DEBUG",
-                Level::TRACE => "TRACE",
-            };
-            
-            let now = chrono::Local::now();
-            let timestamp = now.format("%Y-%m-%dT%H:%M:%S%.3f%:z");
-            let message = format!("{} {}: {}", timestamp, level, visitor.string);
-            
             if let Ok(mut cache) = log_cache.lock() {
                 #[cfg(feature = "tray-icon")]
                 {
-                    // Get UI handles before releasing the lock
-                    let ui_handles = cache.1.clone();
-                    cache.0.push(message.clone());
+                    cache.0.push(formatted_message.clone());
                     
                     if cache.0.len() > self.max_buffer_lines {
                         let drain_count = cache.0.len() - self.max_buffer_lines;
                         cache.0.drain(0..drain_count);
                     }
                     
-                    // Update UI if available
-                    if let Some(mut ui_handles) = ui_handles {
-                        let message_clone = message.clone();
-                        ui_handles.ui.queue_main(move || {
-                            ui_handles.log_textarea.append(&message_clone);
-                            ui_handles.log_textarea.append("\n");
+                    // Real-time UI update if handles are matched
+                    if let Some(ui_handles) = cache.1.as_ref() {
+                        let event_queue = ui_handles.event_queue.clone();
+                        let textarea_ptr = ui_handles.log_textarea.as_ref().map(|t| t.ptr() as usize);
+                        let message_clone = formatted_message.clone();
+                        
+                        event_queue.queue_main(move || {
+                            if let Some(ptr) = textarea_ptr {
+                                unsafe {
+                                    let mut textarea = libui::controls::MultilineEntry::from_raw(ptr as *mut _);
+                                    textarea.append(&message_clone);
+                                    textarea.append("\n");
+                                }
+                            }
                         });
                     }
                 }
-                
                 #[cfg(not(feature = "tray-icon"))]
                 {
-                    cache.push(message);
-                    
+                    cache.push(formatted_message.clone());
                     if cache.len() > self.max_buffer_lines {
                         let drain_count = cache.len() - self.max_buffer_lines;
                         cache.drain(0..drain_count);
                     }
                 }
             }
+        }
+
+        // 2. Write to file if configured
+        if let Some(ref file_arc) = log_file_opt {
+            let mut file = file_arc.lock();
+            let _ = writeln!(file, "{}", formatted_message);
         }
     }
 }
@@ -148,17 +174,7 @@ impl<'a> tracing::field::Visit for StringVisitor {
     }
 }
 
-use tracing_subscriber::fmt::format::Writer;
-use tracing_subscriber::fmt::time::FormatTime;
 
-struct LocalTimer;
-
-impl FormatTime for LocalTimer {
-    fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
-        let now = chrono::Local::now();
-        write!(w, "{}", now.format("%Y-%m-%dT%H:%M:%S%.6f%:z"))
-    }
-}
 
 pub fn init_logging(level: &str) -> PrivoxyResult<()> {
     // Check if logging has already been initialized
@@ -168,24 +184,14 @@ pub fn init_logging(level: &str) -> PrivoxyResult<()> {
     
     errlog::init_log_module();
     
-    // Enable ANSI support on Windows if needed
-    crate::util::enable_ansi_support();
-    
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(level));
 
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_target(false)
-        .with_thread_ids(false)
-        .with_thread_names(false)
-        .with_ansi(true)
-        .with_level(true)
-        .with_timer(LocalTimer)
-        .with_filter(env_filter);
+    let gui_layer = GuiLogLayer::new(None, 1000);
 
     tracing_subscriber::registry()
-        .with(fmt_layer)
+        .with(env_filter)
+        .with(gui_layer)
         .init();
 
     LOGGING_INITIALIZED.store(true, Ordering::Relaxed);
@@ -207,31 +213,30 @@ pub fn init_logging_with_gui(level: &str, log_cache: Option<LogCache>, max_buffe
     
     errlog::init_log_module();
     
-    // Enable ANSI support on Windows if needed
-    crate::util::enable_ansi_support();
-    
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(level));
-
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_target(false)
-        .with_thread_ids(false)
-        .with_thread_names(false)
-        .with_ansi(true)
-        .with_level(true)
-        .with_timer(LocalTimer)
-        .with_filter(env_filter);
 
     let gui_layer = GuiLogLayer::new(log_cache, max_buffer_lines);
 
     tracing_subscriber::registry()
-        .with(fmt_layer)
+        .with(env_filter)
         .with(gui_layer)
         .init();
 
     LOGGING_INITIALIZED.store(true, Ordering::Relaxed);
 
+    Ok(())
+}
+
+/// Update the log file handle globally for late-binding
+pub fn update_log_file(path: &Path) -> PrivoxyResult<()> {
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| crate::error::PrivoxyError::Other(format!("Failed to open log file {:?}: {}", path, e)))?;
+    
+    *GUI_LOG_FILE_REGISTRY.write() = Some(Arc::new(parking_lot::Mutex::new(file)));
     Ok(())
 }
 

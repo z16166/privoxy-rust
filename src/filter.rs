@@ -59,11 +59,11 @@ impl FilterRule {
         })
     }
 
-    pub fn apply(&self, content: &str) -> String {
+    pub fn apply<'a>(&self, content: &'a str) -> std::borrow::Cow<'a, str> {
         if !self.enabled {
-            return content.to_string();
+            return std::borrow::Cow::Borrowed(content);
         }
-        self.pattern.replace_all(content, &self.replacement).to_string()
+        self.pattern.replace_all(content, &self.replacement)
     }
 
     pub fn matches(&self, content: &str) -> bool {
@@ -128,17 +128,21 @@ impl FilterJob {
         })
     }
 
-    pub fn apply(&self, content: &str) -> String {
-        self.pattern.replace_all(content, &self.replacement).to_string()
+    pub fn apply<'a>(&self, content: &'a str) -> std::borrow::Cow<'a, str> {
+        self.pattern.replace_all(content, &self.replacement)
     }
 
-    pub fn apply_with_variables(&self, content: &str, variables: &FilterVariables) -> String {
+    pub fn apply_with_variables<'a>(&self, content: &'a str, variables: &FilterVariables) -> std::borrow::Cow<'a, str> {
         let replacement = if self.trivial {
-            self.replacement.clone()
+            std::borrow::Cow::Borrowed(&self.replacement)
         } else {
-            self.substitute_variables(&self.raw_replacement, variables)
+            std::borrow::Cow::Owned(self.substitute_variables(&self.raw_replacement, variables))
         };
-        self.pattern.replace_all(content, &replacement).to_string()
+        
+        match self.pattern.replace_all(content, replacement.as_ref()) {
+            std::borrow::Cow::Owned(s) => std::borrow::Cow::Owned(s),
+            std::borrow::Cow::Borrowed(_) => std::borrow::Cow::Borrowed(content),
+        }
     }
 
     fn substitute_variables(&self, text: &str, variables: &FilterVariables) -> String {
@@ -238,28 +242,37 @@ impl Filter {
         self.jobs.push(job);
     }
 
-    pub fn apply(&self, content: &str) -> String {
+    pub fn apply<'a>(&self, content: &'a str) -> std::borrow::Cow<'a, str> {
         self.apply_with_variables(content, None)
     }
 
-    pub fn apply_with_variables(&self, content: &str, variables: Option<&FilterVariables>) -> String {
-        if !self.enabled {
-            return content.to_string();
+    pub fn apply_with_variables<'a>(&self, content: &'a str, variables: Option<&FilterVariables>) -> std::borrow::Cow<'a, str> {
+        if !self.enabled || self.jobs.is_empty() {
+            return std::borrow::Cow::Borrowed(content);
         }
         
-        let mut result = content.to_string();
+        let mut current = std::borrow::Cow::Borrowed(content);
         for job in &self.jobs {
-            if job.dynamic {
+            let next = if job.dynamic {
                 if let Some(vars) = variables {
-                    result = job.apply_with_variables(&result, vars);
+                    job.apply_with_variables(&current, vars)
                 } else {
-                    result = job.apply(&result);
+                    job.apply(&current)
                 }
             } else {
-                result = job.apply(&result);
+                job.apply(&current)
+            };
+            
+            // If next is owned, it means a change was made. 
+            // If it's borrowed, it points to 'current'.
+            // In Rust, Cow::Borrowed(s) where s is Cow::Owned(o) is not possible easily 
+            // without nested Cows or just into_owned().
+            
+            if let std::borrow::Cow::Owned(s) = next {
+                current = std::borrow::Cow::Owned(s);
             }
         }
-        result
+        current
     }
 }
 
@@ -409,7 +422,7 @@ impl FilterEngine {
     }
 
     pub fn filter_request(&self, request: &HttpRequest) -> Option<Action> {
-        let url = format!("{}{}", request.headers.get("Host").unwrap_or(&"".to_string()), request.path);
+        let url = format!("{}{}", request.get_header("Host").unwrap_or(&"".to_string()), request.path);
 
         for action in &self.actions {
             if action.matches(&url) {
@@ -421,17 +434,20 @@ impl FilterEngine {
     }
 
     pub fn filter_response(&self, response: &mut HttpResponse) {
-        if let Some(content_type) = response.headers.get("Content-Type") {
+        if let Some(content_type) = response.get_header("Content-Type") {
             if content_type.starts_with("text/") {
                 if let Ok(body_str) = std::str::from_utf8(&response.body) {
-                    let mut filtered = body_str.to_string();
+                    let mut filtered = std::borrow::Cow::Borrowed(body_str);
                     for rule in &self.rules {
                         if rule.enabled {
-                            filtered = rule.apply(&filtered);
+                            let next = rule.apply(&filtered);
+                            if let std::borrow::Cow::Owned(s) = next {
+                                filtered = std::borrow::Cow::Owned(s);
+                            }
                         }
                     }
-                    response.body = filtered.into_bytes();
-                    response.headers.insert("Content-Length".to_string(), response.body.len().to_string());
+                    response.body = filtered.as_ref().as_bytes().to_vec();
+                    response.set_header("Content-Length".to_string(), response.body.len().to_string());
                 }
             }
         }
@@ -439,7 +455,7 @@ impl FilterEngine {
 
     pub fn apply_filter(&self, filter_name: &str, content: &str) -> String {
         if let Some(filter) = self.get_filter(filter_name) {
-            filter.apply(content)
+            filter.apply(content).into_owned()
         } else {
             content.to_string()
         }
@@ -462,64 +478,76 @@ impl FilterEngine {
     /// Execute content filters on response body
     /// Ported from execute_content_filters in filters.c
     pub fn execute_content_filters(&self, content: &str, filter_names: &[String]) -> String {
-        let mut result = content.to_string();
+        let mut result = std::borrow::Cow::Borrowed(content);
         
         for filter_name in filter_names {
             if let Some(filter) = self.get_filter(filter_name) {
                 if filter.filter_type == FilterType::Content {
-                    result = filter.apply(&result);
+                    let next = filter.apply(&result);
+                    if let std::borrow::Cow::Owned(s) = next {
+                        result = std::borrow::Cow::Owned(s);
+                    }
                 }
             }
         }
         
-        result
+        result.into_owned()
     }
 
     /// Execute client body filters
     /// Ported from execute_client_body_filters in filters.c
     pub fn execute_client_body_filters(&self, body: &str, filter_names: &[String]) -> String {
-        let mut result = body.to_string();
+        let mut result = std::borrow::Cow::Borrowed(body);
         
         for filter_name in filter_names {
             if let Some(filter) = self.get_filter(filter_name) {
                 if filter.filter_type == FilterType::ClientBody {
-                    result = filter.apply(&result);
+                    let next = filter.apply(&result);
+                    if let std::borrow::Cow::Owned(s) = next {
+                        result = std::borrow::Cow::Owned(s);
+                    }
                 }
             }
         }
         
-        result
+        result.into_owned()
     }
 
     /// Filter client headers
     /// Ported from filter_header in parsers.c (which calls pcrs_filter_header)
-    pub fn filter_client_header(&self, header: &str, filter_names: &[String]) -> String {
-        let mut result = header.to_string();
+    pub fn execute_client_header_filters(&self, header: &str, filter_names: &[String]) -> String {
+        let mut result = std::borrow::Cow::Borrowed(header);
         
         for filter_name in filter_names {
             if let Some(filter) = self.get_filter(filter_name) {
                 if filter.filter_type == FilterType::ClientHeader {
-                    result = filter.apply(&result);
+                    let next = filter.apply(&result);
+                    if let std::borrow::Cow::Owned(s) = next {
+                        result = std::borrow::Cow::Owned(s);
+                    }
                 }
             }
         }
         
-        result
+        result.into_owned()
     }
 
     /// Filter server headers
-    pub fn filter_server_header(&self, header: &str, filter_names: &[String]) -> String {
-        let mut result = header.to_string();
+    pub fn execute_server_header_filters(&self, header: &str, filter_names: &[String]) -> String {
+        let mut result = std::borrow::Cow::Borrowed(header);
         
         for filter_name in filter_names {
             if let Some(filter) = self.get_filter(filter_name) {
                 if filter.filter_type == FilterType::ServerHeader {
-                    result = filter.apply(&result);
+                    let next = filter.apply(&result);
+                    if let std::borrow::Cow::Owned(s) = next {
+                        result = std::borrow::Cow::Owned(s);
+                    }
                 }
             }
         }
         
-        result
+        result.into_owned()
     }
 
     /// Execute client body taggers
@@ -532,7 +560,7 @@ impl FilterEngine {
                 if tagger.filter_type == FilterType::ClientBodyTagger {
                     let result = tagger.apply(body);
                     if result != body && !result.is_empty() {
-                        tags.push(result);
+                        tags.push(result.into_owned());
                     }
                 }
             }
@@ -550,7 +578,7 @@ impl FilterEngine {
                 if tagger.filter_type == tagger_type {
                     let result = tagger.apply(header);
                     if result != header && !result.is_empty() {
-                        tags.push(result);
+                        tags.push(result.into_owned());
                     }
                 }
             }
@@ -618,7 +646,7 @@ impl FilterEngine {
     /// Apply actions for URL
     pub fn apply_url_actions(&self, request: &HttpRequest) -> Vec<&Action> {
         let url = format!("{}{}", 
-            request.headers.get("Host").unwrap_or(&"".to_string()), 
+            request.get_header("Host").unwrap_or(&"".to_string()), 
             request.path);
         
         self.actions.iter()
@@ -1349,7 +1377,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_client_header() {
+    fn test_execute_client_header_filters() {
         let mut engine = FilterEngine::new();
         
         let mut filter = Filter::new("header-filter", "Header filter", FilterType::ClientHeader);
@@ -1357,12 +1385,12 @@ mod tests {
         engine.add_filter(filter);
         
         let header = "User-Agent: Mozilla/5.0";
-        let result = engine.filter_client_header(header, &vec!["header-filter".to_string()]);
+        let result = engine.execute_client_header_filters(header, &vec!["header-filter".to_string()]);
         assert!(result.contains("Privoxy"));
     }
 
     #[test]
-    fn test_filter_server_header() {
+    fn test_execute_server_header_filters() {
         let mut engine = FilterEngine::new();
         
         let mut filter = Filter::new("server-header-filter", "Server header filter", FilterType::ServerHeader);
@@ -1370,7 +1398,7 @@ mod tests {
         engine.add_filter(filter);
         
         let header = "Server: Apache/2.4";
-        let result = engine.filter_server_header(header, &vec!["server-header-filter".to_string()]);
+        let result = engine.execute_server_header_filters(header, &vec!["server-header-filter".to_string()]);
         assert!(result.contains("Privoxy"));
     }
 

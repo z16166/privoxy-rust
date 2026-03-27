@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -632,10 +633,11 @@ mod tests {
         
         assert!(!file_list.has_been_modified());
         
+        // Use a longer sleep BEFORE writing modification to ensure mtime diff
+        thread::sleep(Duration::from_millis(3200));
+        
         // Modify the file
         fs::write(&temp_file, "{+block} modified.com").unwrap();
-        // Use a longer sleep to ensure filesystem mtime updates (some OS have 1s resolution)
-        thread::sleep(Duration::from_millis(3100));
         
         assert!(file_list.has_been_modified());
         

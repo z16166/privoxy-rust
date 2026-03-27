@@ -489,25 +489,12 @@ impl EditableFile {
             )));
         }
         self.lines.remove(index);
+        self.version += 1;
         Ok(())
     }
 
     /// Insert a new URL pattern after an action header
     pub fn insert_url_pattern(&mut self, after_line_index: usize, url_pattern: &str) -> PrivoxyResult<()> {
-        if after_line_index >= self.lines.len() {
-            return Err(PrivoxyError::Other(format!(
-                "Line index {} out of range",
-                after_line_index
-            )));
-        }
-
-        // Check that the line after which we're inserting is an action header
-        if self.lines[after_line_index].line_type != LineType::Action {
-            return Err(PrivoxyError::Other(
-                "Can only insert URL pattern after an action header".to_string()
-            ));
-        }
-
         let new_line = FileLine {
             line_type: LineType::Url,
             raw: url_pattern.to_string(),
@@ -516,7 +503,42 @@ impl EditableFile {
             data: LineData::None,
         };
 
-        self.lines.insert(after_line_index + 1, new_line);
+        if after_line_index >= self.lines.len() {
+            self.lines.push(new_line);
+        } else {
+            self.lines.insert(after_line_index + 1, new_line);
+        }
+        self.version += 1;
+        Ok(())
+    }
+
+    /// Insert a new action section after the specified line
+    pub fn insert_section(&mut self, after_line_index: usize, actions: &str) -> PrivoxyResult<()> {
+        let new_line = FileLine {
+            line_type: LineType::Action,
+            raw: format!("{{{}}}\n", actions),
+            prefix: String::new(),
+            unprocessed: actions.to_string(),
+            data: LineData::Action(actions.to_string()),
+        };
+        
+        if after_line_index >= self.lines.len() {
+            self.lines.push(new_line);
+        } else {
+            self.lines.insert(after_line_index + 1, new_line);
+        }
+        self.version += 1;
+        Ok(())
+    }
+
+    /// Swap two lines
+    pub fn swap_lines(&mut self, idx1: usize, idx2: usize) -> PrivoxyResult<()> {
+        if idx1 >= self.lines.len() || idx2 >= self.lines.len() {
+            return Err(PrivoxyError::Other("Invalid line index for swap".to_string()));
+        }
+        
+        self.lines.swap(idx1, idx2);
+        self.version += 1;
         Ok(())
     }
 

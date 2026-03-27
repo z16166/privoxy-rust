@@ -21,6 +21,7 @@ use crate::encode;
 
 #[cfg(feature = "cgi-edit-actions")]
 use crate::cgiedit::EditableFile;
+use std::fmt::Write;
 
 pub struct CgiHandler {
     config: Arc<Config>,
@@ -304,11 +305,8 @@ impl CgiHandler {
     /// Handle if-then-else conditionals: @if-name-then@TRUE@else-not-name@FALSE@endif-name@
     fn handle_if_then_else(&self, template: &str, symbols: &HashMap<String, String>) -> String {
         let mut result = template.to_string();
-        let mut changed = true;
         
-        while changed {
-            changed = false;
-            
+        loop {
             // Find @if-xxx-then@
             // Use a regex to find the start tag correctly even if there are multiple @if- tags
             let if_pattern = regex::Regex::new(r"@if-(.+?)-then@").unwrap();
@@ -342,7 +340,6 @@ impl CgiHandler {
                         // Replace entire conditional with appropriate text
                         let replacement = if condition_true { &true_text } else { &false_text };
                         result.replace_range(if_start..endif_abs + endif_marker.len(), replacement);
-                        changed = true;
                     } else {
                         // Could not find endif, skip this tag for now to avoid infinite loop
                         // This might happen if tags are malformed
@@ -363,11 +360,8 @@ impl CgiHandler {
     /// Handle simple conditional blocks: @if-namestart@...@if-name-end@
     fn handle_conditional_blocks(&self, template: &str, symbols: &HashMap<String, String>) -> String {
         let mut result = template.to_string();
-        let mut changed = true;
         
-        while changed {
-            changed = false;
-            
+        loop {
             // Find @if-xxxstart@
             let if_start_pattern = regex::Regex::new(r"@if-(.+?)start@").unwrap();
             if let Some(caps) = if_start_pattern.captures(&result) {
@@ -395,7 +389,6 @@ impl CgiHandler {
                         // Remove entire block
                         result.replace_range(if_start..end_abs + end_marker.len(), "");
                     }
-                    changed = true;
                 } else {
                     break;
                 }
@@ -634,7 +627,7 @@ impl CgiHandler {
                 }
             },
             #[cfg(feature = "cgi-edit-actions")]
-            "/eaa" | "/add-url-pattern" => {
+            "/eaa" => {
                 if !self.config.enable_edit_actions {
                     self.generate_error_disabled("editing actions")
                 } else if !self.referrer_is_safe(&req) {
@@ -872,7 +865,6 @@ impl CgiHandler {
 
     #[cfg(feature = "cgi-edit-actions")]
     fn generate_edit_actions_list(&self) -> String {
-        use std::fmt::Write;
         
         let mut html = String::new();
         html.push_str(&format!(r#"<!DOCTYPE html>
@@ -913,7 +905,7 @@ impl CgiHandler {
 
     #[cfg(feature = "cgi-edit-actions")]
     fn generate_edit_actions_file(&self, filename: &str) -> String {
-        use std::fmt::Write;
+
         
         // Try to load and parse the actions file
         let mut file = EditableFile::new(filename, 0);
@@ -1055,7 +1047,7 @@ impl CgiHandler {
 
     #[cfg(feature = "cgi-edit-actions")]
     fn generate_edit_action_line(&self, req: &HyperRequest<Incoming>) -> String {
-        use std::fmt::Write;
+
         
         let query = req.uri().query().unwrap_or_default();
         let params: HashMap<&str, &str> = query.split('&')
@@ -1373,7 +1365,7 @@ impl CgiHandler {
 
     #[cfg(feature = "cgi-edit-actions")]
     fn generate_edit_actions_for_url(&self, req: &HyperRequest<Incoming>) -> String {
-        use std::fmt::Write;
+
         
         // Parse URL from query string
         let url = if let Some(query) = req.uri().query() {
@@ -1455,10 +1447,8 @@ impl CgiHandler {
     }
 
     #[cfg(feature = "cgi-edit-actions")]
-
-    #[cfg(feature = "cgi-edit-actions")]
     fn handle_edit_actions_for_url_submit(&self, params: &HashMap<String, String>) -> String {
-        use std::fmt::Write;
+
         
         let filename = params.get("file").cloned().unwrap_or_default();
         let action = params.get("action").map(|s| s.as_str()).unwrap_or("");
@@ -1567,7 +1557,7 @@ impl CgiHandler {
 
     #[cfg(feature = "cgi-edit-actions")]
     fn generate_submit_changes(&self) -> String {
-        use std::fmt::Write;
+
         
         let mut html = String::new();
         let _ = write!(html, r#"<!DOCTYPE html>
@@ -1595,9 +1585,8 @@ impl CgiHandler {
     }
 
     #[cfg(feature = "cgi-edit-actions")]
-    #[cfg(feature = "cgi-edit-actions")]
     fn generate_add_section_form(&self, req: &HyperRequest<Incoming>) -> String {
-        use std::fmt::Write;
+
         let query = req.uri().query().unwrap_or_default();
         let params = self.parse_query_string(query);
         let filename = params.get("file").cloned().unwrap_or_default();
@@ -1632,7 +1621,7 @@ impl CgiHandler {
 
     #[cfg(feature = "cgi-edit-actions")]
     fn generate_remove_section_form(&self, req: &HyperRequest<Incoming>) -> String {
-        use std::fmt::Write;
+
         let query = req.uri().query().unwrap_or_default();
         let params = self.parse_query_string(query);
         let filename = params.get("file").cloned().unwrap_or_default();
@@ -1664,7 +1653,7 @@ impl CgiHandler {
 
     #[cfg(feature = "cgi-edit-actions")]
     fn generate_swap_sections_form(&self, req: &HyperRequest<Incoming>) -> String {
-        use std::fmt::Write;
+
         let query = req.uri().query().unwrap_or_default();
         let params = self.parse_query_string(query);
         let filename = params.get("file").cloned().unwrap_or_default();

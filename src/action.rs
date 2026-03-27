@@ -34,6 +34,7 @@ pub fn find_action_for_url(url: &str, config: &Config) -> Option<Action> {
     None
 }
 
+#[allow(dead_code)]
 pub fn find_action_for_url_with_tags(url: &str, config: &Config, ctx: &ActionContext) -> Option<Action> {
     let mut action = find_action_for_url(url, config)?;
     
@@ -64,6 +65,7 @@ fn find_action_for_tag(tag: &str, config: &Config) -> Option<Action> {
     None
 }
 
+#[allow(dead_code)]
 fn merge_actions(target: &mut Action, source: &Action) {
     if source.block {
         target.block = true;
@@ -186,13 +188,13 @@ fn parse_url_components(url: &str) -> (String, Option<u16>, String) {
 /// compile_vanilla_host_pattern() / domain_match() logic.
 ///
 /// Anchoring rules (from C code):
-/// - Leading '.' in pattern → ANCHOR_LEFT (right-side of domain is unanchored)
+/// - Leading '.' in pattern => ANCHOR_LEFT (right-side of domain is unanchored)
 ///   ".youtube.com" matches "youtube.com", "www.youtube.com", etc.
-/// - Trailing '.' in pattern → ANCHOR_RIGHT (left-side is unanchored)
+/// - Trailing '.' in pattern => ANCHOR_RIGHT (left-side is unanchored)
 ///   "ad." matches "ad.example.com", etc.
-/// - Both → fully unanchored
-/// - Neither → fully anchored (exact match only)
-/// - '*' in domain components → wildcard matching
+/// - Both => fully unanchored
+/// - Neither => fully anchored (exact match only)
+/// - '*' in domain components => wildcard matching
 fn host_pattern_matches(host: &str, pattern: &str) -> bool {
     let host = host.to_lowercase();
     let pattern_lower = pattern.to_lowercase();
@@ -206,7 +208,7 @@ fn host_pattern_matches(host: &str, pattern: &str) -> bool {
         .trim_end_matches('.');
     
     if core_pattern.is_empty() {
-        // Pattern is just "." or ".." — matches everything
+        // Pattern is just "." or ".." �?matches everything
         return true;
     }
     
@@ -318,7 +320,7 @@ fn path_pattern_matches(path: &str, pattern: &str) -> bool {
 }
 
 pub fn apply_client_header_taggers(
-    headers: &std::collections::HashMap<String, String>,
+    headers: &crate::http::Headers,
     config: &Config,
     action: &Action,
     ctx: &mut ActionContext,
@@ -337,7 +339,7 @@ pub fn apply_client_header_taggers(
 }
 
 pub fn apply_server_header_taggers(
-    headers: &std::collections::HashMap<String, String>,
+    headers: &crate::http::Headers,
     config: &Config,
     action: &Action,
     ctx: &mut ActionContext,
@@ -392,7 +394,7 @@ fn apply_tagger(tagger: &Filter, input: &str, variables: &FilterVariables) -> Op
     };
     
     if result != input && !result.is_empty() {
-        Some(result)
+        Some(result.into_owned())
     } else {
         None
     }
@@ -422,7 +424,6 @@ fn add_tag(ctx: &mut ActionContext, tag: &str, config: &Config) {
 fn find_filter<'a>(config: &'a Config, name: &str, filter_type: FilterType) -> Option<&'a Filter> {
     config.filters.iter().find(|f| f.name == name && f.filter_type == filter_type)
 }
-
 pub fn apply_client_body_filter(
     body: &mut Vec<u8>,
     config: &Config,
@@ -433,11 +434,17 @@ pub fn apply_client_body_filter(
         return Ok(());
     }
     
-    let mut body_str = match String::from_utf8(body.clone()) {
+    // Take ownership of body vector to avoid cloning into String
+    let mut body_str = match String::from_utf8(std::mem::take(body)) {
         Ok(s) => s,
-        Err(_) => return Ok(()),
+        Err(e) => {
+            // Restore body on error
+            *body = e.into_bytes();
+            return Ok(());
+        }
     };
     
+    let mut changed = false;
     for filter_name in &action.client_body_filter_names {
         if let Some(filter) = find_filter(config, filter_name, FilterType::ClientBody) {
             if !filter.enabled {
@@ -445,22 +452,30 @@ pub fn apply_client_body_filter(
             }
             
             let before_len = body_str.len();
-            body_str = if filter.dynamic {
+            let next = if filter.dynamic {
                 filter.apply_with_variables(&body_str, Some(variables))
             } else {
                 filter.apply(&body_str)
             };
             
-            if body_str.len() != before_len {
+            if let std::borrow::Cow::Owned(s) = next {
+                body_str = s;
+                changed = true;
                 debug!("Applied client-body-filter '{}' ({} -> {} bytes)", 
                     filter_name, before_len, body_str.len());
             }
         }
     }
     
-    *body = body_str.into_bytes();
+    // Only convert back and assign if something changed
+    if changed {
+        *body = body_str.into_bytes();
+    } else {
+        *body = body_str.into_bytes(); // Still need to restore taken body
+    }
     Ok(())
 }
+
 
 /// Apply content filters to response body
 /// Ported from execute_content_filters in filters.c
@@ -474,11 +489,17 @@ pub fn apply_content_filters(
         return Ok(());
     }
     
-    let mut body_str = match String::from_utf8(body.clone()) {
+    // Take ownership of body vector to avoid cloning into String
+    let mut body_str = match String::from_utf8(std::mem::take(body)) {
         Ok(s) => s,
-        Err(_) => return Ok(()),
+        Err(e) => {
+            // Restore body on error
+            *body = e.into_bytes();
+            return Ok(());
+        }
     };
     
+    let mut changed = false;
     for filter_name in &action.filter_names {
         if let Some(filter) = find_filter(config, filter_name, FilterType::Content) {
             if !filter.enabled {
@@ -486,27 +507,33 @@ pub fn apply_content_filters(
             }
             
             let before_len = body_str.len();
-            body_str = if filter.dynamic {
+            let next_cow = if filter.dynamic {
                 filter.apply_with_variables(&body_str, Some(variables))
             } else {
                 filter.apply(&body_str)
             };
             
-            if body_str.len() != before_len {
+            if let std::borrow::Cow::Owned(s) = next_cow {
+                body_str = s;
+                changed = true;
                 debug!("Applied content filter '{}' ({} -> {} bytes)", 
                     filter_name, before_len, body_str.len());
             }
         }
     }
     
-    *body = body_str.into_bytes();
+    if changed {
+        *body = body_str.into_bytes();
+    } else {
+        *body = body_str.into_bytes(); // Restore taken body
+    }
     Ok(())
 }
 
 /// Apply client header filters
 /// Ported from filter_header in parsers.c
 pub fn apply_client_header_filters(
-    headers: &mut std::collections::HashMap<String, String>,
+    headers: &mut crate::http::Headers,
     config: &Config,
     action: &Action,
     variables: &FilterVariables,
@@ -517,28 +544,34 @@ pub fn apply_client_header_filters(
                 continue;
             }
             
-            let mut new_headers = std::collections::HashMap::new();
-            for (name, value) in headers.iter() {
+            let old_headers = std::mem::take(headers);
+            for (name, value) in old_headers {
                 let header_line = format!("{}: {}", name, value);
                 let filtered = if filter.dynamic {
                     filter.apply_with_variables(&header_line, Some(variables))
-                } else {
+                 } else {
                     filter.apply(&header_line)
-                };
+                 };
+                
+                if filtered.is_empty() {
+                    debug!("Header filter {} removed header {}: {}", filter_name, name, value);
+                    continue;
+                }
                 
                 if let Some((n, v)) = filtered.split_once(':') {
-                    new_headers.insert(n.trim().to_string(), v.trim().to_string());
+                    headers.push((n.trim().to_string(), v.trim().to_string()));
+                } else {
+                    // Fallback: keep original if parsing fails but not empty
+                    headers.push((name, value));
                 }
             }
-            
-            *headers = new_headers;
         }
     }
 }
 
 /// Apply server header filters
 pub fn apply_server_header_filters(
-    headers: &mut std::collections::HashMap<String, String>,
+    headers: &mut crate::http::Headers,
     config: &Config,
     action: &Action,
     variables: &FilterVariables,
@@ -549,8 +582,8 @@ pub fn apply_server_header_filters(
                 continue;
             }
             
-            let mut new_headers = std::collections::HashMap::new();
-            for (name, value) in headers.iter() {
+            let old_headers = std::mem::take(headers);
+            for (name, value) in old_headers {
                 let header_line = format!("{}: {}", name, value);
                 let filtered = if filter.dynamic {
                     filter.apply_with_variables(&header_line, Some(variables))
@@ -558,47 +591,53 @@ pub fn apply_server_header_filters(
                     filter.apply(&header_line)
                 };
                 
+                if filtered.is_empty() {
+                    debug!("Header filter {} removed header {}: {}", filter_name, name, value);
+                    continue;
+                }
+                
                 if let Some((n, v)) = filtered.split_once(':') {
-                    new_headers.insert(n.trim().to_string(), v.trim().to_string());
+                    headers.push((n.trim().to_string(), v.trim().to_string()));
+                } else {
+                    // Fallback: keep original if parsing fails but not empty
+                    headers.push((name, value));
                 }
             }
-            
-            *headers = new_headers;
         }
     }
 }
 
 pub fn apply_add_header(
-    headers: &mut std::collections::HashMap<String, String>,
+    headers: &mut crate::http::Headers,
     action: &Action,
 ) {
     for header in &action.add_headers {
         if let Some((name, value)) = header.split_once(':') {
-            headers.insert(name.trim().to_string(), value.trim().to_string());
+            crate::http::set_header(headers, name.trim(), value.trim());
             debug!("Added header: {}: {}", name.trim(), value.trim());
         }
     }
 }
 
 pub fn apply_crunch_client_header(
-    headers: &mut std::collections::HashMap<String, String>,
+    headers: &mut crate::http::Headers,
     action: &Action,
 ) {
     for pattern in &action.crunch_client_headers {
         let pattern_lower = pattern.to_lowercase();
-        let headers_to_remove: Vec<String> = headers.keys()
+        let headers_to_remove: Vec<String> = headers.iter().map(|(n, _)| n.clone())
             .filter(|k| k.to_lowercase().contains(&pattern_lower))
-            .cloned()
+            
             .collect();
         for header in headers_to_remove {
             debug!("Crunching client header: {}", header);
-            headers.remove(&header);
+            crate::http::remove_header(headers, &header);
         }
     }
 }
 
 pub fn apply_client_header_actions(
-    headers: &mut std::collections::HashMap<String, String>,
+    headers: &mut crate::http::Headers,
     config: &Config,
     action: &Action,
     variables: &FilterVariables,
@@ -611,26 +650,19 @@ pub fn apply_client_header_actions(
     apply_crunch_client_header(headers, action);
     
     if action.crunch_outgoing_cookies {
-        headers.remove("Cookie");
+        crate::http::remove_header(headers, "Cookie");
         debug!("Crunched outgoing cookies");
     }
 
     if action.crunch_if_none_match {
-        headers.remove("If-None-Match");
+        crate::http::remove_header(headers, "If-None-Match");
         debug!("Crunched If-None-Match");
     }
 
     // 3. Modifying specific headers
     apply_hide_referrer(headers, action);
-    
-    if let Some(ref ua) = action.hide_user_agent {
-        headers.insert("User-Agent".to_string(), ua.clone());
-        debug!("Set User-Agent to: {}", ua);
-    } else if let Some(ref ua) = action.send_user_agent {
-        headers.insert("User-Agent".to_string(), ua.clone());
-        debug!("Set User-Agent to: {}", ua);
-    }
-    
+    apply_hide_user_agent(headers, action);
+    apply_send_user_agent(headers, action);
     apply_hide_from_header(headers, action);
     apply_hide_accept_language(headers, action);
     apply_hide_if_modified_since(headers, action);
@@ -643,7 +675,7 @@ pub fn apply_client_header_actions(
 }
 
 pub fn apply_server_header_actions(
-    headers: &mut std::collections::HashMap<String, String>,
+    headers: &mut crate::http::Headers,
     config: &Config,
     action: &Action,
     variables: &FilterVariables,
@@ -655,7 +687,7 @@ pub fn apply_server_header_actions(
     apply_crunch_server_header(headers, action);
     
     if action.crunch_incoming_cookies {
-        headers.remove("Set-Cookie");
+        crate::http::remove_header(headers, "Set-Cookie");
         debug!("Crunched incoming cookies");
     }
 
@@ -666,38 +698,38 @@ pub fn apply_server_header_actions(
 }
 
 pub fn apply_crunch_server_header(
-    headers: &mut std::collections::HashMap<String, String>,
+    headers: &mut crate::http::Headers,
     action: &Action,
 ) {
     for pattern in &action.crunch_server_headers {
         let pattern_lower = pattern.to_lowercase();
-        let headers_to_remove: Vec<String> = headers.keys()
+        let headers_to_remove: Vec<String> = headers.iter().map(|(n, _)| n.clone())
             .filter(|k| k.to_lowercase().contains(&pattern_lower))
-            .cloned()
+            
             .collect();
         for header in headers_to_remove {
             debug!("Crunching server header: {}", header);
-            headers.remove(&header);
+            crate::http::remove_header(headers, &header);
         }
     }
 }
 
 pub fn apply_change_x_forwarded_for(
-    headers: &mut std::collections::HashMap<String, String>,
+    headers: &mut crate::http::Headers,
     action: &Action,
     client_addr: &str,
 ) {
     if let Some(ref mode) = action.change_x_forwarded_for {
         if mode == "block" {
-            headers.remove("X-Forwarded-For");
+            crate::http::remove_header(headers, "X-Forwarded-For");
             debug!("Blocking X-Forwarded-For header");
         } else if mode == "add" {
             if let Some(client_ip) = client_addr.split(':').next() {
-                if let Some(existing) = headers.get("X-Forwarded-For") {
-                    headers.insert("X-Forwarded-For".to_string(), 
+                if let Some(existing) = crate::http::get_header(headers, "X-Forwarded-For") {
+                    crate::http::set_header(headers, "X-Forwarded-For".to_string(), 
                         format!("{}, {}", existing, client_ip));
                 } else {
-                    headers.insert("X-Forwarded-For".to_string(), client_ip.to_string());
+                    crate::http::set_header(headers, "X-Forwarded-For", client_ip);
                 }
                 debug!("Added client IP to X-Forwarded-For: {}", client_ip);
             }
@@ -706,87 +738,92 @@ pub fn apply_change_x_forwarded_for(
 }
 
 pub fn apply_hide_referrer(
-    headers: &mut std::collections::HashMap<String, String>,
+    headers: &mut crate::http::Headers,
     action: &Action,
 ) {
     if let Some(ref referrer) = action.hide_referrer {
         if referrer == "conditional-block" || referrer == "block" {
-            headers.remove("Referer");
+            crate::http::remove_header(headers, "Referer");
             debug!("Blocking Referer header");
         } else if referrer == "conditional-forge" || referrer == "forge" {
-            if let Some(host) = headers.get("Host") {
+            if let Some(host) = crate::http::get_header(headers, "Host") {
                 let scheme = if let Some(port) = host.split(':').last() {
                     if port == "443" { "https" } else { "http" }
                 } else {
                     "http"
                 };
-                headers.insert("Referer".to_string(), format!("{}://{}/", scheme, host));
+                crate::http::set_header(headers, "Referer".to_string(), format!("{}://{}/", scheme, host));
                 debug!("Forged Referer header");
             }
         } else {
-            headers.insert("Referer".to_string(), referrer.clone());
+            crate::http::set_header(headers, "Referer".to_string(), referrer);
             debug!("Set Referer to: {}", referrer);
         }
     }
 }
 
 pub fn apply_hide_user_agent(
-    headers: &mut std::collections::HashMap<String, String>,
+    headers: &mut crate::http::Headers,
     action: &Action,
 ) {
-    if action.hide_user_agent.is_some() {
-        headers.remove("User-Agent");
-        debug!("Hiding User-Agent header");
+    if let Some(ref ua) = action.hide_user_agent {
+        if ua == "block" {
+            crate::http::remove_header(headers, "User-Agent");
+            debug!("Blocking User-Agent header");
+        } else {
+            crate::http::set_header(headers, "User-Agent".to_string(), ua);
+            debug!("Hiding User-Agent, setting to: {}", ua);
+        }
     }
 }
 
 pub fn apply_send_user_agent(
-    headers: &mut std::collections::HashMap<String, String>,
+    headers: &mut crate::http::Headers,
     action: &Action,
 ) {
     if let Some(ref ua) = action.send_user_agent {
-        headers.insert("User-Agent".to_string(), ua.clone());
+        crate::http::set_header(headers, "User-Agent".to_string(), ua);
         debug!("Setting User-Agent to: {}", ua);
     }
 }
 
 pub fn apply_hide_from_header(
-    headers: &mut std::collections::HashMap<String, String>,
+    headers: &mut crate::http::Headers,
     action: &Action,
 ) {
     if let Some(ref mode) = action.hide_from_header {
         if mode == "block" {
-            headers.remove("From");
+            crate::http::remove_header(headers, "From");
             debug!("Blocking From header");
         } else {
-            headers.insert("From".to_string(), mode.clone());
+            crate::http::set_header(headers, "From".to_string(), mode);
             debug!("Setting From header to: {}", mode);
         }
     }
 }
 
 pub fn apply_hide_accept_language(
-    headers: &mut std::collections::HashMap<String, String>,
+    headers: &mut crate::http::Headers,
     action: &Action,
 ) {
     if let Some(ref mode) = action.hide_accept_language {
         if mode == "block" {
-            headers.remove("Accept-Language");
+            crate::http::remove_header(headers, "Accept-Language");
             debug!("Blocking Accept-Language header");
         } else {
-            headers.insert("Accept-Language".to_string(), mode.clone());
+            crate::http::set_header(headers, "Accept-Language".to_string(), mode);
             debug!("Setting Accept-Language to: {}", mode);
         }
     }
 }
 
 pub fn apply_hide_if_modified_since(
-    headers: &mut std::collections::HashMap<String, String>,
+    headers: &mut crate::http::Headers,
     action: &Action,
 ) {
     if let Some(ref mode) = action.hide_if_modified_since {
         if mode == "block" {
-            headers.remove("If-Modified-Since");
+            crate::http::remove_header(headers, "If-Modified-Since");
             debug!("Blocking If-Modified-Since header");
         } else if let Ok(offset) = mode.parse::<i64>() {
             use std::time::{SystemTime, UNIX_EPOCH};
@@ -794,7 +831,7 @@ pub fn apply_hide_if_modified_since(
                 let timestamp = now.as_secs() as i64 + offset;
                 if let Some(dt) = chrono::DateTime::from_timestamp(timestamp, 0) {
                     let date_str = dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
-                    headers.insert("If-Modified-Since".to_string(), date_str);
+                    crate::http::set_header(headers, "If-Modified-Since".to_string(), date_str);
                     debug!("Setting If-Modified-Since with offset {}", offset);
                 }
             }
@@ -803,27 +840,27 @@ pub fn apply_hide_if_modified_since(
 }
 
 pub fn apply_hide_content_disposition(
-    headers: &mut std::collections::HashMap<String, String>,
+    headers: &mut crate::http::Headers,
     action: &Action,
 ) {
     if let Some(ref mode) = action.hide_content_disposition {
         if mode == "block" {
-            headers.remove("Content-Disposition");
+            crate::http::remove_header(headers, "Content-Disposition");
             debug!("Blocking Content-Disposition header");
         } else {
-            headers.insert("Content-Disposition".to_string(), mode.clone());
+            crate::http::set_header(headers, "Content-Disposition".to_string(), mode);
             debug!("Setting Content-Disposition to: {}", mode);
         }
     }
 }
 
 pub fn apply_prevent_compression(
-    headers: &mut std::collections::HashMap<String, String>,
+    headers: &mut crate::http::Headers,
     action: &Action,
 ) {
     if action.prevent_compression {
-        headers.remove("Accept-Encoding");
-        headers.insert("Accept-Encoding".to_string(), "identity".to_string());
+        crate::http::remove_header(headers, "Accept-Encoding");
+        crate::http::set_header(headers, "Accept-Encoding", "identity");
         debug!("Preventing compression");
     }
 }
@@ -836,11 +873,11 @@ pub fn apply_downgrade_http_version(version: &mut String, action: &Action) {
 }
 
 pub fn apply_session_cookies_only(
-    headers: &mut std::collections::HashMap<String, String>,
+    headers: &mut crate::http::Headers,
     action: &Action,
 ) {
     if action.session_cookies_only {
-        if let Some(cookie) = headers.get("Cookie").cloned() {
+        if let Some(cookie) = crate::http::get_header(headers, "Cookie") {
             let filtered_cookie: String = cookie
                 .split(';')
                 .filter(|c| {
@@ -849,36 +886,36 @@ pub fn apply_session_cookies_only(
                 })
                 .collect::<Vec<_>>()
                 .join(";");
-            headers.insert("Cookie".to_string(), filtered_cookie);
+            crate::http::set_header(headers, "Cookie".to_string(), filtered_cookie);
             debug!("Converted cookies to session-only");
         }
     }
 }
 
 pub fn apply_content_type_overwrite(
-    headers: &mut std::collections::HashMap<String, String>,
+    headers: &mut crate::http::Headers,
     action: &Action,
 ) {
     if let Some(ref content_type) = action.content_type_overwrite {
-        headers.insert("Content-Type".to_string(), content_type.clone());
+        crate::http::set_header(headers, "Content-Type".to_string(), content_type);
         debug!("Overwriting Content-Type to: {}", content_type);
     }
 }
 
 pub fn apply_overwrite_last_modified(
-    headers: &mut std::collections::HashMap<String, String>,
+    headers: &mut crate::http::Headers,
     action: &Action,
 ) {
     if let Some(ref mode) = action.overwrite_last_modified {
         if mode == "block" {
-            headers.remove("Last-Modified");
+            crate::http::remove_header(headers, "Last-Modified");
             debug!("Blocking Last-Modified header");
         } else if mode == "reset-to-request-time" {
             use std::time::{SystemTime, UNIX_EPOCH};
             if let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) {
                 if let Some(dt) = chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0) {
                     let timestamp = dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
-                    headers.insert("Last-Modified".to_string(), timestamp);
+                    crate::http::set_header(headers, "Last-Modified".to_string(), timestamp);
                     debug!("Reset Last-Modified to request time");
                 }
             }
@@ -888,7 +925,7 @@ pub fn apply_overwrite_last_modified(
             let random_offset = (now % 86400) as i64;
             if let Some(dt) = chrono::DateTime::from_timestamp(now as i64 - random_offset, 0) {
                 let timestamp = dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
-                headers.insert("Last-Modified".to_string(), timestamp);
+                crate::http::set_header(headers, "Last-Modified".to_string(), timestamp);
                 debug!("Randomized Last-Modified");
             }
         }
@@ -896,11 +933,11 @@ pub fn apply_overwrite_last_modified(
 }
 
 pub fn apply_limit_cookie_lifetime(
-    headers: &mut std::collections::HashMap<String, String>,
+    headers: &mut crate::http::Headers,
     action: &Action,
 ) {
     if let Some(lifetime_secs) = action.limit_cookie_lifetime {
-        if let Some(cookie) = headers.get("Set-Cookie").cloned() {
+        if let Some(cookie) = crate::http::get_header(headers, "Set-Cookie") {
             let max_age_attr = format!("Max-Age={}", lifetime_secs);
             let new_cookie = if cookie.to_lowercase().contains("max-age=") {
                 let re = Regex::new(r"(?i)Max-Age=\d+").unwrap();
@@ -908,18 +945,18 @@ pub fn apply_limit_cookie_lifetime(
             } else {
                 format!("{}; {}", cookie, max_age_attr)
             };
-            headers.insert("Set-Cookie".to_string(), new_cookie);
+            crate::http::set_header(headers, "Set-Cookie".to_string(), new_cookie);
             debug!("Limited cookie lifetime to {} seconds", lifetime_secs);
         }
     }
 }
 
 pub fn apply_force_text_mode(
-    headers: &mut std::collections::HashMap<String, String>,
+    headers: &mut crate::http::Headers,
     action: &Action,
 ) {
     if action.force_text_mode {
-        headers.insert("Content-Type".to_string(), "text/plain".to_string());
+        crate::http::set_header(headers, "Content-Type", "text/plain");
         debug!("Forcing text mode");
     }
 }
@@ -1040,6 +1077,7 @@ h1 {{ color: #c00; }}
         ].into_iter().collect(),
         body: body.into_bytes(),
         compression_level: 0,
+        header_len: 0,
     }
 }
 
@@ -1063,20 +1101,22 @@ pub fn create_blocked_image_response() -> crate::http::HttpResponse {
         ].into_iter().collect(),
         body: blank_gif.to_vec(),
         compression_level: 0,
+        header_len: 0,
     }
 }
 
-pub fn create_empty_document_response() -> crate::http::HttpResponse {
+pub fn create_empty_document_response(status_code: u16, status_text: &str) -> crate::http::HttpResponse {
     crate::http::HttpResponse {
         version: "HTTP/1.1".to_string(),
-        status_code: 200,
-        status_text: "OK".to_string(),
+        status_code,
+        status_text: status_text.to_string(),
         headers: vec![
             ("Content-Type".to_string(), "text/html".to_string()),
             ("Content-Length".to_string(), "0".to_string()),
         ].into_iter().collect(),
         body: Vec::new(),
         compression_level: 0,
+        header_len: 0,
     }
 }
 
@@ -1091,6 +1131,7 @@ pub fn create_redirect_response(redirect_url: &str) -> crate::http::HttpResponse
         ].into_iter().collect(),
         body: Vec::new(),
         compression_level: 0,
+        header_len: 0,
     }
 }
 
@@ -1126,5 +1167,29 @@ mod tests {
         action.limit_connect = Some("8080-8090".to_string());
         assert!(check_limit_connect(&action, 8085));
         assert!(!check_limit_connect(&action, 80));
+    }
+
+    #[test]
+    fn test_apply_header_actions() {
+        use crate::config::Action;
+        use crate::http::Headers;
+        
+        let mut headers: Headers = vec![
+            ("User-Agent".to_string(), "Mozilla/5.0".to_string()),
+            ("Referer".to_string(), "http://google.com/".to_string()),
+            ("Host".to_string(), "example.com".to_string()),
+        ];
+        
+        let mut action = Action::default();
+        action.hide_user_agent = Some("Privoxy/1.0".to_string());
+        action.hide_referrer = Some("http://forge.com/".to_string());
+        
+        let config = crate::config::Config::default();
+        let variables = FilterVariables::default();
+        
+        apply_client_header_actions(&mut headers, &config, &action, &variables, "127.0.0.1");
+        
+        assert_eq!(crate::http::get_header(&headers, "User-Agent"), Some(&"Privoxy/1.0".to_string()));
+        assert_eq!(crate::http::get_header(&headers, "Referer"), Some(&"http://forge.com/".to_string()));
     }
 }
