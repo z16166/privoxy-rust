@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
