@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::error::{PrivoxyError, PrivoxyResult};
@@ -54,14 +55,13 @@ pub struct TrayIconApp {
     activity_animation: bool,
     show_window: bool,
     window_thread: Option<std::thread::JoinHandle<()>>,
-    #[cfg(feature = "tray-icon")]
-    log_cache: logger::LogCache,
-    #[cfg(not(feature = "tray-icon"))]
     log_cache: logger::LogCache,
     max_buffer_lines: usize,
     log_file: Option<std::fs::File>,
     icon_manager: Option<IconManager>,
     current_frame: usize,
+    animation_remaining: usize,
+    last_requests: u64,
     tray_icon: Option<tray_icon::TrayIcon>,
     #[cfg(feature = "tray-icon")]
     menu: Option<TrayMenu>,
@@ -116,7 +116,7 @@ impl TrayIconApp {
         
         Self {
             config,
-            state,
+            state: state.clone(),
             shutdown_sender: Arc::new(std::sync::Mutex::new(Some(shutdown_sender))),
             log_messages: true,
             message_highlighting: true,
@@ -129,6 +129,8 @@ impl TrayIconApp {
             log_file,
             icon_manager,
             current_frame: 0,
+            animation_remaining: 0,
+            last_requests: state.statistics.get_requests_received(),
             tray_icon: None,
             #[cfg(feature = "tray-icon")]
             menu: None,
@@ -138,7 +140,7 @@ impl TrayIconApp {
     }
 
     fn show_window(&mut self) {
-        if let Some(ref handles) = self.ui_handles {
+        if let Some(ref _handles) = self.ui_handles {
             // Bypass libui entirely for subsequent shows.
             // Just use Win32 API to bring the existing window to the front.
             #[cfg(windows)]
@@ -218,7 +220,7 @@ impl TrayIconApp {
             
             // Edit Menu
             let edit_menu = Menu::new("Edit");
-            let copy_item = edit_menu.append_item("Copy");
+            let _copy_item = edit_menu.append_item("Copy");
             
             // View Menu
             let view_menu = Menu::new("View");
@@ -423,10 +425,11 @@ impl TrayIconApp {
                 let new_icon = if !self.state.is_enabled() {
                     // Use off icon when disabled
                     manager.get_off().unwrap_or_else(|| manager.get_default())
-                } else if self.activity_animation {
+                } else if self.activity_animation && self.animation_remaining > 0 {
                     // Use animated icon when enabled and animation is on
+                    let frame = self.current_frame % 8;
                     self.current_frame = (self.current_frame + 1) % 8;
-                    manager.get_animated(self.current_frame).unwrap_or_else(|| manager.get_default())
+                    manager.get_animated(frame).unwrap_or_else(|| manager.get_default())
                 } else {
                     // Use default icon
                     manager.get_default()
@@ -585,7 +588,11 @@ impl TrayIconApp {
             std::process::exit(0);
         });
         
-        event_loop.run(move |event, _| {
+        // Tick management for animation
+        let mut last_tick = std::time::Instant::now();
+        let tick_duration = std::time::Duration::from_millis(100);
+
+        event_loop.run(move |event, elwt| {
             // Create tray icon after event loop is initialized for all platforms
             if tray_icon_local.is_none() {
                 if matches!(event, winit::event::Event::NewEvents(winit::event::StartCause::Init)) {
@@ -607,6 +614,35 @@ impl TrayIconApp {
                         }
                     }
                 }
+            }
+            
+            // Handle animation tick (every 100ms)
+            if let winit::event::Event::AboutToWait = event {
+                let now = std::time::Instant::now();
+                if now.duration_since(last_tick) >= tick_duration {
+                    last_tick = now;
+                    
+                    // Check for proxy activity
+                    let current_requests = self.state.statistics.get_requests_received();
+                    if current_requests > self.last_requests {
+                        self.last_requests = current_requests;
+                        // Start or refresh animation (10 ticks = 1000ms duration)
+                        self.animation_remaining = 10;
+                    }
+                    
+                    if self.animation_remaining > 0 {
+                        self.animation_remaining -= 1;
+                        self.update_tray_icon();
+                    } else if current_requests == self.last_requests && self.state.is_enabled() {
+                        // Ensure idle icon if we just finished animating
+                        // Only update if we were previously animating to avoid redundant work
+                        // Wait, update_tray_icon() is cheap enough but let's be safe.
+                        // Actually it's better to just call it once when reaching 0.
+                    }
+                }
+                
+                // Request next tick
+                elwt.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(last_tick + tick_duration));
             }
             
             // Check for shutdown event
@@ -1143,22 +1179,24 @@ unsafe extern "system" fn subclass_proc(
     use windows::Win32::UI::WindowsAndMessaging::{WM_CLOSE, ShowWindow, SW_HIDE};
     use windows::Win32::UI::Shell::DefSubclassProc;
     if msg == WM_CLOSE {
-        let _ = ShowWindow(hwnd, SW_HIDE);
+        unsafe { let _ = ShowWindow(hwnd, SW_HIDE); }
         
         // Re-enable main window if it was the About window being closed
         if _id == 1002 {
             use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow};
             use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
             use windows::core::w;
-            if let Ok(main_hwnd) = FindWindowW(None, w!("Privoxy")) {
-                let _ = EnableWindow(main_hwnd, true);
-                let _ = SetForegroundWindow(main_hwnd);
+            unsafe {
+                if let Ok(main_hwnd) = FindWindowW(None, w!("Privoxy")) {
+                    let _ = EnableWindow(main_hwnd, true);
+                    let _ = SetForegroundWindow(main_hwnd);
+                }
             }
         }
         
         return windows::Win32::Foundation::LRESULT(0); // Prevent destruction
     }
-    DefSubclassProc(hwnd, msg, wparam, lparam)
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
 
 #[cfg(feature = "tray-icon")]
