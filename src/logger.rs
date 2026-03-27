@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -21,7 +21,13 @@ use parking_lot::RwLock;
 static GUI_LOG_CACHE_REGISTRY: Lazy<RwLock<Option<LogCache>>> = Lazy::new(|| RwLock::new(None));
 
 /// Global registry for the log file handle to allow late-binding
-static GUI_LOG_FILE_REGISTRY: Lazy<RwLock<Option<Arc<parking_lot::Mutex<File>>>>> = Lazy::new(|| RwLock::new(None));
+pub struct LogState {
+    pub file: File,
+    pub lines_since_flush: usize,
+    pub last_flush: std::time::Instant,
+}
+
+static GUI_LOG_FILE_REGISTRY: Lazy<RwLock<Option<Arc<parking_lot::Mutex<LogState>>>>> = Lazy::new(|| RwLock::new(None));
 
 /// UI handle and log textarea handle for real-time updates
 #[cfg(feature = "tray-icon")]
@@ -46,10 +52,8 @@ pub type LogCache = Arc<std::sync::Mutex<Vec<String>>>;
 /// Custom layer that writes log messages to both file and GUI cache (unified logging)
 pub struct GuiLogLayer {
     log_cache: Option<LogCache>,
-    log_file: Option<Arc<parking_lot::Mutex<File>>>,
+    log_file: Option<Arc<parking_lot::Mutex<LogState>>>,
     max_buffer_lines: usize,
-    last_flush: Arc<parking_lot::Mutex<std::time::Instant>>,
-    lines_since_flush: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl GuiLogLayer {
@@ -58,8 +62,6 @@ impl GuiLogLayer {
             log_cache,
             log_file: None,
             max_buffer_lines,
-            last_flush: Arc::new(parking_lot::Mutex::new(std::time::Instant::now())),
-            lines_since_flush: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
@@ -167,17 +169,16 @@ where
         }
 
         // 2. Write to file if configured
-        if let Some(ref file_arc) = log_file_opt {
-            let mut file = file_arc.lock();
-            let _ = writeln!(file, "{}", formatted_message);
+        if let Some(ref state_arc) = log_file_opt {
+            let mut state = state_arc.lock();
+            let _ = writeln!(state.file, "{}", formatted_message);
             
             // Increment line count and check if we should flush
-            let count = self.lines_since_flush.fetch_add(1, Ordering::SeqCst) + 1;
-            let mut last_flush = self.last_flush.lock();
-            if count >= 20 || last_flush.elapsed().as_secs() >= 5 {
-                let _ = file.flush();
-                self.lines_since_flush.store(0, Ordering::SeqCst);
-                *last_flush = std::time::Instant::now();
+            state.lines_since_flush += 1;
+            if state.lines_since_flush >= 20 || state.last_flush.elapsed().as_secs() >= 5 {
+                let _ = state.file.flush();
+                state.lines_since_flush = 0;
+                state.last_flush = std::time::Instant::now();
             }
         }
     }
@@ -271,7 +272,13 @@ pub fn update_log_file(path: &Path) -> PrivoxyResult<()> {
         .open(path)
         .map_err(|e| crate::error::PrivoxyError::Other(format!("Failed to open log file {:?}: {}", path, e)))?;
     
-    *GUI_LOG_FILE_REGISTRY.write() = Some(Arc::new(parking_lot::Mutex::new(file)));
+    let state = LogState {
+        file,
+        lines_since_flush: 0,
+        last_flush: std::time::Instant::now(),
+    };
+    
+    *GUI_LOG_FILE_REGISTRY.write() = Some(Arc::new(parking_lot::Mutex::new(state)));
     Ok(())
 }
 
