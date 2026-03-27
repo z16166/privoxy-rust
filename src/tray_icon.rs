@@ -33,7 +33,7 @@ use rfd::MessageDialog;
 #[cfg(feature = "tray-icon")]
 use libui::prelude::*;
 #[cfg(feature = "tray-icon")]
-use libui::controls::{VerticalBox, MultilineEntry, LayoutStrategy, TextEntry};
+use libui::controls::{VerticalBox, MultilineEntry, LayoutStrategy, TextEntry, Button};
 #[cfg(feature = "tray-icon")]
 use libui::menus::Menu;
 
@@ -305,12 +305,46 @@ impl TrayIconApp {
                 let _ = opener::open("http://config.privoxy.org/show-status");
             });
             help_menu.append_separator();
-            help_menu.append_item("About Privoxy...").on_clicked(|_, _| {
+            // Create About window once
+            let mut about_window = Window::new(&ui, "About Privoxy", 600, 300, WindowType::NoMenubar);
+            about_window.set_margined(true);
+            let mut about_vbox = VerticalBox::new();
+            about_vbox.set_padded(true);
+            let mut about_text = MultilineEntry::new();
+            about_text.set_readonly(true);
+            about_text.set_value("Privoxy version 4.1.0 for Windows\n\
+                           Copyright (C) 2000-2023 the Privoxy Team\n\
+                           Based on the Internet Junkbuster by Junkbusters Corp.\n\n\
+                           This is free software; it may be used and copied under the\n\
+                           GNU General Public License, version 2.\n\
+                           This program comes with ABSOLUTELY NO WARRANTY OF ANY KIND.");
+            about_vbox.append(about_text, LayoutStrategy::Stretchy);
+            let mut about_close_btn = Button::new("Close");
+            let mut about_window_close = about_window.clone();
+            about_close_btn.on_clicked(move |_| {
+                about_window_close.hide();
+            });
+            about_vbox.append(about_close_btn, LayoutStrategy::Compact);
+            about_window.set_child(about_vbox);
+
+            let mut about_window_handler = about_window.clone();
+            help_menu.append_item("About Privoxy...").on_clicked(move |_, _| {
                 info!("Help -> About clicked");
-                let dialog = rfd::MessageDialog::new()
-                    .set_title("About Privoxy")
-                    .set_description("Privoxy version 4.1.0 for Windows\nCopyright (C) 2000-2023 the Privoxy Team\nBased on the Internet Junkbuster by Junkbusters Corp.\nThis is free software; it may be used and copied under the\nGNU General Public License, version 2.\nThis program comes with ABSOLUTELY NO WARRANTY OF ANY KIND.");
-                dialog.show();
+                about_window_handler.show();
+                
+                // Center the About window too
+                #[cfg(windows)]
+                unsafe {
+                    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SetWindowPos, HWND_TOP, SWP_SHOWWINDOW, SWP_NOSIZE, FindWindowW};
+                    use windows::core::w;
+                    let screen_width = GetSystemMetrics(SM_CXSCREEN);
+                    let screen_height = GetSystemMetrics(SM_CYSCREEN);
+                    let x = (screen_width - 600) / 2;
+                    let y = (screen_height - 300) / 2;
+                    if let Ok(hwnd) = FindWindowW(None, w!("About Privoxy")) {
+                         let _ = SetWindowPos(hwnd, HWND_TOP, x, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+                    }
+                }
             });
             
             // Send handles back to main thread
@@ -1040,7 +1074,23 @@ fn load_icon() -> Result<tray_icon::Icon, Box<dyn std::error::Error>> {
 #[cfg(feature = "tray-icon")]
 fn setup_log_window(ui: &UI, log_cache: &logger::LogCache, clear_log_item: &SendMenuItem, visible: bool) {
     info!("Setting up log window (visible: {})", visible);
-    let mut window = Window::new(ui, "Privoxy", 1500, 1000, WindowType::HasMenubar);
+    let mut window = Window::new(ui, "Privoxy", 1800, 1000, WindowType::HasMenubar);
+    
+    // Center window on screen
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SetWindowPos, HWND_TOP, SWP_SHOWWINDOW, SWP_NOSIZE, FindWindowW};
+        use windows::core::w;
+        let screen_width = GetSystemMetrics(SM_CXSCREEN);
+        let screen_height = GetSystemMetrics(SM_CYSCREEN);
+        let x = (screen_width - 1800) / 2;
+        let y = (screen_height - 1000) / 2;
+        // We need the window to exist for FindWindowW to work.
+        // libui Window::new creates the HWND but doesn't show it.
+        if let Ok(hwnd) = FindWindowW(None, w!("Privoxy")) {
+             let _ = SetWindowPos(hwnd, HWND_TOP, x, y, 0, 0, SWP_NOSIZE);
+        }
+    }
     
     let mut vbox = VerticalBox::new();
     vbox.set_padded(true);
