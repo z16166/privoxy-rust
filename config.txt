@@ -1,4 +1,0 @@
-listen-address 127.0.0.1:8118
-debug 12288
-actionsfile C:\Tools\privoxy\pac.action
-toggle 1
