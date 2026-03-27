@@ -478,8 +478,7 @@ impl TrayIconApp {
 
         // Create other Top-level items
         let menu_item_toggle = TrayCheckMenuItem::new("Enable", true, self.state.is_enabled(), None);
-        let menu_item_show_window = TrayCheckMenuItem::new("Show Privoxy Window", true, self.show_window, None);
-        
+        let menu_item_show_window = TrayMenuItem::new("Show Privoxy Window", true, None);
         // Items needed by handlers but not strictly in Tray menu, we will keep their IDs mapped from main window interactions if possible.
         // But tray_icon only emits events for items IN the tray menu. The log menu is natively handled by libui for the window, so tray_icon events only trigger from tray menu.
         // Wait, some commands in the event loop are used by tray menu, others might be unused now but still defined.
@@ -563,7 +562,7 @@ impl TrayIconApp {
             }
             
             // Check for tray icon events
-            if let Ok(tray_event) = TrayIconEvent::receiver().try_recv() {
+            while let Ok(tray_event) = TrayIconEvent::receiver().try_recv() {
                 match tray_event {
                     TrayIconEvent::Click { button: MouseButton::Left, .. } => {
                         info!("Tray icon left clicked - showing window");
@@ -578,7 +577,7 @@ impl TrayIconApp {
             }
             
             // Check for menu events
-            if let Ok(event) = MenuEvent::receiver().try_recv() {
+            while let Ok(event) = MenuEvent::receiver().try_recv() {
                 let event_id = &event.id;
                 if event_id == &exit_id {
                     info!("Exit clicked");
@@ -1072,14 +1071,34 @@ fn load_icon() -> Result<tray_icon::Icon, Box<dyn std::error::Error>> {
 
 /// Helper function to setup or recreate the log window on the UI thread
 #[cfg(feature = "tray-icon")]
+#[cfg(windows)]
+unsafe extern "system" fn subclass_proc(
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+    _id: usize,
+    _data: usize,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{WM_CLOSE, ShowWindow, SW_HIDE};
+    use windows::Win32::UI::Shell::DefSubclassProc;
+    if msg == WM_CLOSE {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+        return windows::Win32::Foundation::LRESULT(0); // Prevent destruction
+    }
+    DefSubclassProc(hwnd, msg, wparam, lparam)
+}
+
+#[cfg(feature = "tray-icon")]
 fn setup_log_window(ui: &UI, log_cache: &logger::LogCache, clear_log_item: &SendMenuItem, visible: bool) {
     info!("Setting up log window (visible: {})", visible);
     let mut window = Window::new(ui, "Privoxy", 1800, 1000, WindowType::HasMenubar);
     
-    // Center window on screen
+    // Center window on screen and subclass to intercept close
     #[cfg(windows)]
     unsafe {
         use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SetWindowPos, HWND_TOP, SWP_SHOWWINDOW, SWP_NOSIZE, FindWindowW};
+        use windows::Win32::UI::Shell::SetWindowSubclass;
         use windows::core::w;
         let screen_width = GetSystemMetrics(SM_CXSCREEN);
         let screen_height = GetSystemMetrics(SM_CYSCREEN);
@@ -1089,6 +1108,7 @@ fn setup_log_window(ui: &UI, log_cache: &logger::LogCache, clear_log_item: &Send
         // libui Window::new creates the HWND but doesn't show it.
         if let Ok(hwnd) = FindWindowW(None, w!("Privoxy")) {
              let _ = SetWindowPos(hwnd, HWND_TOP, x, y, 0, 0, SWP_NOSIZE);
+             let _ = SetWindowSubclass(hwnd, Some(subclass_proc), 1, 0);
         }
     }
     
