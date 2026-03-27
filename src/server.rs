@@ -154,12 +154,8 @@ impl ProxyServer {
                         continue;
                     }
 
-                    // Check if proxy is enabled
-                    if !state.is_enabled() {
-                        warn!("Proxy is disabled, rejecting {}", addr);
-                        Self::send_proxy_disabled_error(stream).await;
-                        continue;
-                    }
+                    // Note: Proxy toggle state (is_enabled) is now checked in connection.rs 
+                    // to bypass filters rather than rejecting connections, matching original Privoxy.
 
                     // Spawn a task to handle the connection
                     let state_clone = state.clone();

@@ -45,6 +45,11 @@ impl CgiHandler {
         }
     }
 
+    /// Check if proxy is globally enabled
+    pub fn is_enabled(&self) -> bool {
+        self.state.is_enabled()
+    }
+
     /// Check if a request is for an internal CGI page
     pub fn is_cgi_request(&self, req: &HttpRequest) -> bool {
         let host = req.host.as_str();
@@ -228,7 +233,10 @@ impl CgiHandler {
         symbols.insert("code-status".to_string(), code_status.to_string());
         
         // Toggle support
+        #[cfg(feature = "toggle")]
         symbols.insert("can-toggle".to_string(), "1".to_string());
+        #[cfg(not(feature = "toggle"))]
+        symbols.insert("can-toggle".to_string(), "0".to_string());
         
         // Enabled/disabled state
         if self.state.is_enabled() {

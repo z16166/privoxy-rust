@@ -235,8 +235,11 @@ impl TrayIconApp {
             
             // Options Menu
             let options_menu = Menu::new("Options");
-            let enable_item = options_menu.append_check_item("Enable");
-            enable_item.set_checked(true);
+            #[cfg(feature = "toggle")]
+            {
+                let enable_item = options_menu.append_check_item("Enable");
+                enable_item.set_checked(true);
+            }
             options_menu.append_separator();
 
             let config_clone = config.clone();
@@ -477,21 +480,29 @@ impl TrayIconApp {
         ).map_err(|e| PrivoxyError::Other(format!("Menu error: {}", e)))?;
 
         // Create other Top-level items
+        #[cfg(feature = "toggle")]
         let menu_item_toggle = TrayCheckMenuItem::new("Enable", true, self.state.is_enabled(), None);
         let menu_item_show_window = TrayMenuItem::new("Show Privoxy Window", true, None);
         // Items needed by handlers but not strictly in Tray menu, we will keep their IDs mapped from main window interactions if possible.
         // But tray_icon only emits events for items IN the tray menu. The log menu is natively handled by libui for the window, so tray_icon events only trigger from tray menu.
         // Wait, some commands in the event loop are used by tray menu, others might be unused now but still defined.
         
-        // Create main menu with all submenus and items for Tray
-        let menu = TrayMenu::with_items(&[
+        let sep1 = PredefinedMenuItem::separator();
+        let sep2 = PredefinedMenuItem::separator();
+        let mut menu_items: Vec<&dyn tray_icon::menu::IsMenuItem> = vec![
             &menu_item_exit,
-            &PredefinedMenuItem::separator(),
+            &sep1,
             &submenu_edit,
-            &PredefinedMenuItem::separator(),
-            &menu_item_toggle,
-            &menu_item_show_window,
-        ]).map_err(|e| PrivoxyError::Other(format!("Menu error: {}", e)))?;
+            &sep2,
+        ];
+        
+        #[cfg(feature = "toggle")]
+        menu_items.push(&menu_item_toggle);
+        
+        menu_items.push(&menu_item_show_window);
+        
+        // Create main menu with all submenus and items for Tray
+        let menu = TrayMenu::with_items(menu_items.as_slice()).map_err(|e| PrivoxyError::Other(format!("Menu error: {}", e)))?;
 
         // Store menu for dynamic attachment
         self.menu = Some(menu.clone());
@@ -508,6 +519,7 @@ impl TrayIconApp {
         let edit_user_filters_id = menu_item_edit_user_filters.id().clone();
         #[cfg(feature = "trust")]
         let edit_trust_id = menu_item_edit_trust.id().clone();
+        #[cfg(feature = "toggle")]
         let toggle_id = menu_item_toggle.id().clone();
         let show_window_id = menu_item_show_window.id().clone();
 
@@ -622,7 +634,12 @@ impl TrayIconApp {
                     if let Some(ref confdir) = config.confdir {
                         let _ = opener::open(confdir.join("trust"));
                     }
-                } else if event_id == &toggle_id {
+                } else if {
+                    #[cfg(feature = "toggle")]
+                    { event_id == &toggle_id }
+                    #[cfg(not(feature = "toggle"))]
+                    { false }
+                } {
                     let enabled = self.state.toggle();
                     info!("Privoxy toggled {}", if enabled { "ON" } else { "OFF" });
                     self.update_tray_icon();

@@ -322,9 +322,11 @@ impl ConnectionHandler {
         debug!("Handling CONNECT request to {}:{}", request.host, request.port);
 
         let url = format!("{}:{}", request.host, request.port);
-        let action = {
+        let action = if self.cgi_handler.is_enabled() {
             let config = self.config.read();
             find_action_for_url(&url, &config)
+        } else {
+            None
         };
         
         if let Some(ref a) = action {
@@ -364,9 +366,11 @@ impl ConnectionHandler {
         debug!("Proxying request to {}:{}", target_host, target_port);
 
         let mut action_ctx = ActionContext::default();
-        let action = {
+        let action = if self.cgi_handler.is_enabled() {
             let config = self.config.read();
             find_action_for_url(&url, &config)
+        } else {
+            None
         };
 
         if let Some(ref a) = action {
