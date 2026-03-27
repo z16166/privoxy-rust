@@ -39,9 +39,11 @@ use libui::controls::{VerticalBox, MultilineEntry, LayoutStrategy, TextEntry};
 use libui::menus::Menu;
 
 #[cfg(all(feature = "tray-icon", windows))]
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, w};
 #[cfg(all(feature = "tray-icon", windows))]
-use windows::Win32::Foundation::HINSTANCE;
+use windows::Win32::Foundation::{HINSTANCE, HWND};
+#[cfg(all(feature = "tray-icon", windows))]
+use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow};
 
 pub struct TrayIconApp {
     config: Arc<Config>,
@@ -146,6 +148,16 @@ impl TrayIconApp {
                     if let Some(ref mut gui_handles) = cache.1 {
                         if let Some(ref mut window) = gui_handles.window {
                             window.show();
+                            
+                            // Bring to foreground on Windows
+                            #[cfg(windows)]
+                            unsafe {
+                                if let Ok(hwnd) = FindWindowW(None, w!("Privoxy")) {
+                                    if !hwnd.is_invalid() {
+                                        let _ = SetForegroundWindow(hwnd);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
