@@ -348,9 +348,11 @@ impl TrayIconApp {
                 // Center the About window too
                 #[cfg(windows)]
                 unsafe {
-                    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SetWindowPos, HWND_TOP, SWP_SHOWWINDOW, SWP_NOSIZE, FindWindowW};
+                    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SetWindowPos, HWND_TOP, SWP_SHOWWINDOW, SWP_NOSIZE, FindWindowW, SendMessageW, WM_SETICON, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTSIZE, LoadImageW};
                     use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
-                    use windows::core::w;
+                    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+                    use windows::Win32::Foundation::{HINSTANCE, WPARAM, LPARAM};
+                    use windows::core::{w, PCWSTR};
                     let screen_width = GetSystemMetrics(SM_CXSCREEN);
                     let screen_height = GetSystemMetrics(SM_CYSCREEN);
                     let x = (screen_width - 800) / 2;
@@ -360,9 +362,24 @@ impl TrayIconApp {
                          let _ = SetForegroundWindow(hwnd);
                          let _ = SetWindowPos(hwnd, HWND_TOP, x, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
                          
+                         // Set About window icon
+                         if let Ok(hmodule) = GetModuleHandleW(None) {
+                             if let Ok(hicon) = LoadImageW(HINSTANCE(hmodule.0), PCWSTR(200u16 as *const u16), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE) {
+                                 let _ = SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(hicon.0 as isize));
+                                 let _ = SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(hicon.0 as isize));
+                             }
+                         }
+
                          // Disable main window to make this pseudo-modal
                          if let Ok(main_hwnd) = FindWindowW(None, w!("Privoxy")) {
                              let _ = EnableWindow(main_hwnd, false);
+                             // Set main window icon (if not already set by libui)
+                             if let Ok(hmodule) = GetModuleHandleW(None) {
+                                 if let Ok(hicon) = LoadImageW(HINSTANCE(hmodule.0), PCWSTR(200u16 as *const u16), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE) {
+                                     let _ = SendMessageW(main_hwnd, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(hicon.0 as isize));
+                                     let _ = SendMessageW(main_hwnd, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(hicon.0 as isize));
+                                 }
+                             }
                          }
 
                          // Prevent the About window "X" button from destroying the window handle and libui thread
@@ -1152,9 +1169,11 @@ fn setup_log_window(ui: &UI, log_cache: &logger::LogCache, clear_log_item: &Send
     // Center window on screen and subclass to intercept close
     #[cfg(windows)]
     unsafe {
-        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SetWindowPos, HWND_TOP, SWP_SHOWWINDOW, SWP_NOSIZE, FindWindowW};
+        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SetWindowPos, HWND_TOP, SWP_SHOWWINDOW, SWP_NOSIZE, FindWindowW, SendMessageW, WM_SETICON, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTSIZE, LoadImageW};
         use windows::Win32::UI::Shell::SetWindowSubclass;
-        use windows::core::w;
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::Foundation::{HINSTANCE, WPARAM, LPARAM};
+        use windows::core::{w, PCWSTR};
         let screen_width = GetSystemMetrics(SM_CXSCREEN);
         let screen_height = GetSystemMetrics(SM_CYSCREEN);
         let x = (screen_width - 1800) / 2;
@@ -1164,6 +1183,14 @@ fn setup_log_window(ui: &UI, log_cache: &logger::LogCache, clear_log_item: &Send
         if let Ok(hwnd) = FindWindowW(None, w!("Privoxy")) {
              let _ = SetWindowPos(hwnd, HWND_TOP, x, y, 0, 0, SWP_NOSIZE);
              let _ = SetWindowSubclass(hwnd, Some(subclass_proc), 1, 0);
+             
+             // Set application icon from resource ID 200 (IDI_MAINICON)
+             if let Ok(hmodule) = GetModuleHandleW(None) {
+                 if let Ok(hicon) = LoadImageW(HINSTANCE(hmodule.0), PCWSTR(200u16 as *const u16), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE) {
+                     let _ = SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(hicon.0 as isize));
+                     let _ = SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(hicon.0 as isize));
+                 }
+             }
         }
     }
     
