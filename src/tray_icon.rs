@@ -139,34 +139,45 @@ impl TrayIconApp {
 
     fn show_window(&mut self) {
         if let Some(ref handles) = self.ui_handles {
-            let event_queue = handles.event_queue.clone();
-            let log_cache = self.log_cache.clone();
+            // Bypass libui entirely for subsequent shows.
+            // Just use Win32 API to bring the existing window to the front.
+            #[cfg(windows)]
+            unsafe {
+                use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, ShowWindow, SetForegroundWindow, IsIconic, SW_RESTORE, SW_SHOW};
+                use windows::core::w;
+                
+                if let Ok(hwnd) = FindWindowW(None, w!("Privoxy")) {
+                    if !hwnd.is_invalid() {
+                        // Show immediately without libui's involvement
+                        let _ = ShowWindow(hwnd, SW_SHOW);
+                        
+                        // Restore only if currently minimized (iconic)
+                        if IsIconic(hwnd).as_bool() {
+                            let _ = ShowWindow(hwnd, SW_RESTORE);
+                        }
+                        
+                        // Always bring to front, using winit thread's current input focus right
+                        let _ = SetForegroundWindow(hwnd);
+                    }
+                }
+            }
             
-            event_queue.queue_main(move || {
-                if let Ok(mut cache) = log_cache.lock() {
-                    if let Some(ref mut gui_handles) = cache.1 {
-                        if let Some(ref mut window) = gui_handles.window {
-                            window.show();
-                            
-                            // Bring to foreground on Windows
-                            #[cfg(windows)]
-                            unsafe {
-                                if let Ok(hwnd) = FindWindowW(None, w!("Privoxy")) {
-                                    if !hwnd.is_invalid() {
-                                        // Restore only if currently minimized (iconic)
-                                        if IsIconic(hwnd).as_bool() {
-                                            let _ = ShowWindow(hwnd, SW_RESTORE);
-                                        }
-                                        
-                                        // Always bring to front
-                                        let _ = SetForegroundWindow(hwnd);
-                                    }
-                                }
+            // For non-Windows platforms, fallback to queue_main
+            #[cfg(not(windows))]
+            {
+                let event_queue = handles.event_queue.clone();
+                let log_cache = self.log_cache.clone();
+                event_queue.queue_main(move || {
+                    if let Ok(mut cache) = log_cache.lock() {
+                        if let Some(ref mut gui_handles) = cache.1 {
+                            if let Some(ref mut window) = gui_handles.window {
+                                window.show();
                             }
                         }
                     }
-                }
-            });
+                });
+            }
+            
             return;
         }
         
@@ -1057,13 +1068,35 @@ fn setup_log_window(ui: &UI, log_cache: &logger::LogCache, clear_log_item: &Send
     if visible {
         window.show();
     } else {
+        #[cfg(windows)]
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, ShowWindow, SW_HIDE};
+            use windows::core::w;
+            if let Ok(hwnd) = FindWindowW(None, w!("Privoxy")) {
+                if !hwnd.is_invalid() {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                }
+            }
+        }
+        #[cfg(not(windows))]
         window.hide();
     }
     
-    // Handle window closing: hide it, but keep handles to show it later
-    window.on_closing(ui, move |w| {
-        info!("Log window closing, hiding window");
-        w.hide();
+    // Handle window closing: hide it natively, but keep handles to show it later
+    window.on_closing(ui, move |_w| {
+        info!("Log window closing, natively hiding window");
+        #[cfg(windows)]
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, ShowWindow, SW_HIDE};
+            use windows::core::w;
+            if let Ok(hwnd) = FindWindowW(None, w!("Privoxy")) {
+                if !hwnd.is_invalid() {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        _w.hide();
     });
     
     // Set the clear log handler
