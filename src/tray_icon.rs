@@ -492,6 +492,7 @@ impl TrayIconApp {
                 if matches!(event, winit::event::Event::NewEvents(winit::event::StartCause::Init)) {
                     let tray_icon_result = TrayIconBuilder::new()
                         .with_menu(Box::new(menu.clone()))
+                        .with_menu_on_left_click(false)
                         .with_tooltip("Privoxy - Web Proxy")
                         .with_icon(icon.clone())
                         .build();
@@ -521,17 +522,11 @@ impl TrayIconApp {
                 match tray_event {
                     TrayIconEvent::Click { button: MouseButton::Left, .. } => {
                         info!("Tray icon left clicked - showing window");
-                        // Ensure menu is not attached during left click
-                        if let Some(icon) = &self.tray_icon {
-                            icon.set_menu(None);
-                        }
                         self.show_window();
                     }
                     TrayIconEvent::Click { button: MouseButton::Right, .. } => {
-                        info!("Tray icon right clicked - attaching menu");
-                        if let (Some(icon), Some(menu)) = (&self.tray_icon, &self.menu) {
-                            icon.set_menu(Some(Box::new(menu.clone())));
-                        }
+                        info!("Tray icon right clicked");
+                        // The menu is already attached and configured to show only on right click
                     }
                     _ => {}
                 }
