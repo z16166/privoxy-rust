@@ -14,7 +14,6 @@
 *.py
 # Exclude specific files we want to keep
 !README.md
-!config.txt.example
 !w32res.h
 !app.rc
 !privoxy.rc
