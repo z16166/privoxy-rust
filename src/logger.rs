@@ -48,6 +48,8 @@ pub struct GuiLogLayer {
     log_cache: Option<LogCache>,
     log_file: Option<Arc<parking_lot::Mutex<File>>>,
     max_buffer_lines: usize,
+    last_flush: Arc<parking_lot::Mutex<std::time::Instant>>,
+    lines_since_flush: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl GuiLogLayer {
@@ -56,6 +58,8 @@ impl GuiLogLayer {
             log_cache,
             log_file: None,
             max_buffer_lines,
+            last_flush: Arc::new(parking_lot::Mutex::new(std::time::Instant::now())),
+            lines_since_flush: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
@@ -166,6 +170,15 @@ where
         if let Some(ref file_arc) = log_file_opt {
             let mut file = file_arc.lock();
             let _ = writeln!(file, "{}", formatted_message);
+            
+            // Increment line count and check if we should flush
+            let count = self.lines_since_flush.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut last_flush = self.last_flush.lock();
+            if count >= 20 || last_flush.elapsed().as_secs() >= 5 {
+                let _ = file.flush();
+                self.lines_since_flush.store(0, Ordering::SeqCst);
+                *last_flush = std::time::Instant::now();
+            }
         }
     }
 }

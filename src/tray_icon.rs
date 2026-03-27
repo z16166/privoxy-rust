@@ -57,7 +57,6 @@ pub struct TrayIconApp {
     window_thread: Option<std::thread::JoinHandle<()>>,
     log_cache: logger::LogCache,
     max_buffer_lines: usize,
-    log_file: Option<std::fs::File>,
     icon_manager: Option<IconManager>,
     current_frame: usize,
     animation_remaining: usize,
@@ -88,19 +87,6 @@ impl TrayIconApp {
         // Register the log cache with the global registry (initialized in main.rs)
         crate::logger::register_gui_cache(log_cache.clone());
         
-        // Open log file if configured
-        let log_file = match config.log_file.as_ref() {
-            Some(log_path) => {
-                match std::fs::File::create(log_path) {
-                    Ok(file) => Some(file),
-                    Err(e) => {
-                        eprintln!("Failed to open log file: {}", e);
-                        None
-                    }
-                }
-            }
-            None => None,
-        };
         
         // Load icon manager
         let icon_manager = match IconManager::new() {
@@ -126,7 +112,6 @@ impl TrayIconApp {
             window_thread: None,
             log_cache,
             max_buffer_lines,
-            log_file,
             icon_manager,
             current_frame: 0,
             animation_remaining: 0,
@@ -447,42 +432,6 @@ impl TrayIconApp {
         }
     }
     
-    fn add_log_message(&mut self, message: &str) {
-        if self.log_messages {
-            // Add to cache
-            if let Ok(mut cache) = self.log_cache.lock() {
-                #[cfg(feature = "tray-icon")]
-                {
-                    cache.0.push(message.to_string());
-                    
-                    // Limit cache size
-                    if self.limit_buffer_size && cache.0.len() > self.max_buffer_lines {
-                        let drain_count = cache.0.len() - self.max_buffer_lines;
-                        cache.0.drain(0..drain_count);
-                    }
-                }
-                
-                #[cfg(not(feature = "tray-icon"))]
-                {
-                    cache.push(message.to_string());
-                    
-                    // Limit cache size
-                    if self.limit_buffer_size && cache.len() > self.max_buffer_lines {
-                        let drain_count = cache.len() - self.max_buffer_lines;
-                        cache.drain(0..drain_count);
-                    }
-                }
-            }
-            
-            // Write to log file if configured
-            if let Some(log_file) = &mut self.log_file {
-                if let Err(e) = writeln!(log_file, "{}", message) {
-                    eprintln!("Failed to write to log file: {}", e);
-                }
-                let _ = log_file.flush();
-            }
-        }
-    }
 
     pub fn run(&mut self) -> PrivoxyResult<()> {
         // Create Top-level items for Tray
