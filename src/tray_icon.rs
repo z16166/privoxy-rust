@@ -326,6 +326,21 @@ impl TrayIconApp {
             });
             about_vbox.append(about_close_btn, LayoutStrategy::Compact);
             about_window.set_child(about_vbox);
+            
+            let mut about_window_on_closing = about_window.clone();
+            about_window.on_closing(&ui, move |_| {
+                about_window_on_closing.hide();
+                #[cfg(windows)]
+                unsafe {
+                    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow};
+                    use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+                    use windows::core::w;
+                    if let Ok(main_hwnd) = FindWindowW(None, w!("Privoxy")) {
+                        let _ = EnableWindow(main_hwnd, true);
+                        let _ = SetForegroundWindow(main_hwnd);
+                    }
+                }
+            });
 
             let mut about_window_handler = about_window.clone();
             help_menu.append_item("About Privoxy...").on_clicked(move |_, _| {
@@ -368,14 +383,6 @@ impl TrayIconApp {
                                  }
                              }
                          }
-
-                         // Prevent the About window "X" button from destroying the window handle and libui thread
-                         windows::Win32::UI::Shell::SetWindowSubclass(
-                             hwnd,
-                             Some(subclass_proc),
-                             1002, // Unique subclass ID for About window
-                             0,
-                         );
                     }
                 }
             });
@@ -1130,19 +1137,7 @@ unsafe extern "system" fn subclass_proc(
     if msg == WM_CLOSE {
         unsafe { let _ = ShowWindow(hwnd, SW_HIDE); }
         
-        // Re-enable main window if it was the About window being closed
-        if _id == 1002 {
-            use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow};
-            use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
-            use windows::core::w;
-            unsafe {
-                if let Ok(main_hwnd) = FindWindowW(None, w!("Privoxy")) {
-                    let _ = EnableWindow(main_hwnd, true);
-                    let _ = SetForegroundWindow(main_hwnd);
-                }
-            }
-        }
-        
+
         return windows::Win32::Foundation::LRESULT(0); // Prevent destruction
     }
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
