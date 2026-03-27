@@ -8,6 +8,20 @@
 *.swp
 *.swo
 
+# Temporary files
+*.log
+*.txt
+*.py
+# Exclude specific files we want to keep
+!README.md
+!config.txt.example
+!w32res.h
+!app.rc
+!privoxy.rc
+
+# Temporary source pieces
+tray_icon_head.rs
+
 # OS files
 .DS_Store
 Thumbs.db
