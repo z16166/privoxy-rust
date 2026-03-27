@@ -84,11 +84,30 @@ impl CgiHandler {
 
     /// Handle a request discovered via the internal dispatcher
     pub async fn handle_cgi_request(&self, req: HttpRequest) -> HttpResponse {
-        let path = req.path.clone();
+        let full_path = req.path.clone();
+        
+        let path = if full_path.starts_with("http://") || full_path.starts_with("https://") {
+            let prefix_len = if full_path.starts_with("http://") { 7 } else { 8 };
+            if let Some(slash_idx) = full_path[prefix_len..].find('/') {
+                full_path[prefix_len + slash_idx..].to_string()
+            } else {
+                "/".to_string()
+            }
+        } else {
+            full_path
+        };
+        
+        // Strip query parameters for routing
+        let route_path = if let Some(q_idx) = path.find('?') {
+            path[..q_idx].to_string()
+        } else {
+            path
+        };
+        
         let method = req.method.clone();
 
         // Dispatch based on path
-        let (html, status_code, content_type) = if method == "POST" && (path == "/eas" || path == "/edit-actions-submit") {
+        let (html, status_code, content_type) = if method == "POST" && (route_path == "/eas" || route_path == "/edit-actions-submit") {
              // Handle POST via a bridge
              // For now, we simulate the HyperRequest for the existing POST handlers if necessary,
              // or refactor them. Let's refactor the POST handler to take a body.
@@ -96,7 +115,7 @@ impl CgiHandler {
              let body = req.body.clone().unwrap_or_else(|| Bytes::new());
              let params = self.parse_post_body(&body);
              
-             let html = if path == "/edit-actions-submit" {
+             let html = if route_path == "/edit-actions-submit" {
                 #[cfg(feature = "cgi-edit-actions")]
                 { self.handle_edit_actions_submit(&params) }
                 #[cfg(not(feature = "cgi-edit-actions"))]
@@ -109,7 +128,7 @@ impl CgiHandler {
              };
              (html, 200, "text/html; charset=utf-8")
         } else {
-            let html = match path.as_str() {
+            let html = match route_path.as_str() {
                 "/" | "/index.html" => self.generate_main_page(),
                 "/show-status" | "/status" => self.generate_status_page(),
                 "/show-request" => self.generate_show_request_direct(&req),
