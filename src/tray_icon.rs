@@ -309,7 +309,7 @@ impl TrayIconApp {
             });
             help_menu.append_separator();
             // Create About window once
-            let mut about_window = Window::new(&ui, "About Privoxy", 600, 300, WindowType::NoMenubar);
+            let mut about_window = Window::new(&ui, "About Privoxy", 800, 500, WindowType::NoMenubar);
             about_window.set_margined(true);
             let mut about_vbox = VerticalBox::new();
             about_vbox.set_padded(true);
@@ -326,6 +326,16 @@ impl TrayIconApp {
             let mut about_window_close = about_window.clone();
             about_close_btn.on_clicked(move |_| {
                 about_window_close.hide();
+                #[cfg(windows)]
+                unsafe {
+                    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow};
+                    use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+                    use windows::core::w;
+                    if let Ok(main_hwnd) = FindWindowW(None, w!("Privoxy")) {
+                        let _ = EnableWindow(main_hwnd, true);
+                        let _ = SetForegroundWindow(main_hwnd);
+                    }
+                }
             });
             about_vbox.append(about_close_btn, LayoutStrategy::Compact);
             about_window.set_child(about_vbox);
@@ -339,15 +349,22 @@ impl TrayIconApp {
                 #[cfg(windows)]
                 unsafe {
                     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SetWindowPos, HWND_TOP, SWP_SHOWWINDOW, SWP_NOSIZE, FindWindowW};
+                    use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
                     use windows::core::w;
                     let screen_width = GetSystemMetrics(SM_CXSCREEN);
                     let screen_height = GetSystemMetrics(SM_CYSCREEN);
-                    let x = (screen_width - 600) / 2;
-                    let y = (screen_height - 300) / 2;
+                    let x = (screen_width - 800) / 2;
+                    let y = (screen_height - 500) / 2;
                     if let Ok(hwnd) = FindWindowW(None, w!("About Privoxy")) {
                          let _ = ShowWindow(hwnd, SW_RESTORE);
                          let _ = SetForegroundWindow(hwnd);
                          let _ = SetWindowPos(hwnd, HWND_TOP, x, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+                         
+                         // Disable main window to make this pseudo-modal
+                         if let Ok(main_hwnd) = FindWindowW(None, w!("Privoxy")) {
+                             let _ = EnableWindow(main_hwnd, false);
+                         }
+
                          // Prevent the About window "X" button from destroying the window handle and libui thread
                          windows::Win32::UI::Shell::SetWindowSubclass(
                              hwnd,
@@ -1110,6 +1127,18 @@ unsafe extern "system" fn subclass_proc(
     use windows::Win32::UI::Shell::DefSubclassProc;
     if msg == WM_CLOSE {
         let _ = ShowWindow(hwnd, SW_HIDE);
+        
+        // Re-enable main window if it was the About window being closed
+        if _id == 1002 {
+            use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow};
+            use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+            use windows::core::w;
+            if let Ok(main_hwnd) = FindWindowW(None, w!("Privoxy")) {
+                let _ = EnableWindow(main_hwnd, true);
+                let _ = SetForegroundWindow(main_hwnd);
+            }
+        }
+        
         return windows::Win32::Foundation::LRESULT(0); // Prevent destruction
     }
     DefSubclassProc(hwnd, msg, wparam, lparam)
