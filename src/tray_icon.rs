@@ -345,7 +345,16 @@ impl TrayIconApp {
                     let x = (screen_width - 600) / 2;
                     let y = (screen_height - 300) / 2;
                     if let Ok(hwnd) = FindWindowW(None, w!("About Privoxy")) {
+                         let _ = ShowWindow(hwnd, SW_RESTORE);
+                         let _ = SetForegroundWindow(hwnd);
                          let _ = SetWindowPos(hwnd, HWND_TOP, x, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+                         // Prevent the About window "X" button from destroying the window handle and libui thread
+                         windows::Win32::UI::Shell::SetWindowSubclass(
+                             hwnd,
+                             Some(subclass_proc),
+                             1002, // Unique subclass ID for About window
+                             0,
+                         );
                     }
                 }
             });
