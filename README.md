@@ -4,7 +4,10 @@ A Rust (2024 Edition) reimplementation of [Privoxy](https://www.privoxy.org/), t
 
 ## Overview
 
-Privoxy-Rust is a feature-equivalent port of the original C-based Privoxy proxy server. It is fully compatible with the original Privoxy configuration files, action files, and filter files. The proxy listens for HTTP/HTTPS traffic from browsers, applies configurable filtering and forwarding rules, and can forward traffic to upstream SOCKS5/SOCKS4/HTTP proxy servers.
+Privoxy-Rust is a feature-equivalent port of the original C-based Privoxy proxy server. It is fully compatible with the original Privoxy configuration files, action files, and filter files. 
+
+> [!IMPORTANT]
+> This repository contains the **refactored Privoxy main executable only**. All required configuration files (such as `config.txt`, `default.action`, `default.filter`, etc.) should be extracted from the official [Privoxy installation package](https://www.privoxy.org/).
 
 Key advantages over the C implementation:
 - **Memory safety** through Rust's ownership system
@@ -110,7 +113,12 @@ privoxy-rust --help
 
 ## Configuration
 
-Configuration file format is fully compatible with the original Privoxy. Example:
+The configuration file format is fully compatible with the original Privoxy. 
+
+> [!NOTE]
+> All configuration files (`config.txt`, `*.action`, `*.filter`) should be moved from the official Privoxy installation to the program directory before running.
+
+Example configuration:
 
 ```
 listen-address  127.0.0.1:8118
