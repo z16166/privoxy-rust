@@ -43,7 +43,7 @@ use windows::core::{PCWSTR, w};
 #[cfg(all(feature = "tray-icon", windows))]
 use windows::Win32::Foundation::{HINSTANCE, HWND};
 #[cfg(all(feature = "tray-icon", windows))]
-use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE};
+use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE, IsIconic};
 
 pub struct TrayIconApp {
     config: Arc<Config>,
@@ -154,8 +154,12 @@ impl TrayIconApp {
                             unsafe {
                                 if let Ok(hwnd) = FindWindowW(None, w!("Privoxy")) {
                                     if !hwnd.is_invalid() {
-                                        // Restore if minimized, and bring to front
-                                        let _ = ShowWindow(hwnd, SW_RESTORE);
+                                        // Restore only if currently minimized (iconic)
+                                        if IsIconic(hwnd).as_bool() {
+                                            let _ = ShowWindow(hwnd, SW_RESTORE);
+                                        }
+                                        
+                                        // Always bring to front
                                         let _ = SetForegroundWindow(hwnd);
                                     }
                                 }
