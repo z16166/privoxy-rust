@@ -12,12 +12,14 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request as HyperRequest, Response, StatusCode};
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::{debug, error, info, trace};
 
 use crate::config::Config;
 use crate::error::{PrivoxyError, PrivoxyResult};
 use crate::state::AppState;
 use crate::encode;
+use crate::http::{HttpRequest, HttpResponse};
+use std::fmt::Write as _;
 
 #[cfg(feature = "cgi-edit-actions")]
 use crate::cgiedit::EditableFile;
@@ -42,6 +44,124 @@ impl CgiHandler {
             template_dir,
         }
     }
+
+    /// Check if a request is for an internal CGI page
+    pub fn is_cgi_request(&self, req: &HttpRequest) -> bool {
+        let host = req.host.as_str();
+        
+        // Match C implementation: p.p and config.privoxy.org
+        // These are ALWAYS internal CGI hostnames
+        if host.eq_ignore_ascii_case("p.p") || 
+           host.eq_ignore_ascii_case("p.p.") ||
+           host.eq_ignore_ascii_case("config.privoxy.org") ||
+           host.eq_ignore_ascii_case("config.privoxy.org.") {
+            debug!("CGI Match: Magic hostname {}", host);
+            return true;
+        }
+
+        // Also match localhost/127.0.0.1 on the proxy port
+        let is_localhost = host.eq_ignore_ascii_case("localhost") || 
+                           host == "127.0.0.1" || 
+                           host == "::1";
+        
+        if is_localhost {
+            // Check if the port matches one of our listen ports or default 8118
+            if req.port == 8118 {
+                debug!("CGI Match: localhost on default port 8118");
+                return true;
+            }
+
+            let config_guard = self.config.clone();
+            if config_guard.listen_addresses.iter().any(|a| a.port == req.port) {
+                debug!("CGI Match: localhost on listen port {}", req.port);
+                return true;
+            }
+        }
+
+        trace!("CGI No Match: host={}, port={}, path={}", host, req.port, req.path);
+        false
+    }
+
+    /// Handle a request discovered via the internal dispatcher
+    pub async fn handle_cgi_request(&self, req: HttpRequest) -> HttpResponse {
+        let path = req.path.clone();
+        let method = req.method.clone();
+
+        // Dispatch based on path
+        let (html, status_code, content_type) = if method == "POST" && (path == "/eas" || path == "/edit-actions-submit") {
+             // Handle POST via a bridge
+             // For now, we simulate the HyperRequest for the existing POST handlers if necessary,
+             // or refactor them. Let's refactor the POST handler to take a body.
+             
+             let body = req.body.clone().unwrap_or_else(|| Bytes::new());
+             let params = self.parse_post_body(&body);
+             
+             let html = if path == "/edit-actions-submit" {
+                #[cfg(feature = "cgi-edit-actions")]
+                { self.handle_edit_actions_submit(&params) }
+                #[cfg(not(feature = "cgi-edit-actions"))]
+                { self.generate_error_disabled("editing actions") }
+             } else {
+                #[cfg(feature = "cgi-edit-actions")]
+                { self.handle_edit_actions_for_url_submit(&params) }
+                #[cfg(not(feature = "cgi-edit-actions"))]
+                { self.generate_error_disabled("editing actions") }
+             };
+             (html, 200, "text/html; charset=utf-8")
+        } else {
+            let html = match path.as_str() {
+                "/" | "/index.html" => self.generate_main_page(),
+                "/show-status" | "/status" => self.generate_status_page(),
+                "/show-request" => self.generate_show_request_direct(&req),
+                "/show-url-info" => self.generate_show_url_info_direct(&req),
+                "/user-manual" => self.generate_user_manual(),
+                
+                // Toggle
+                #[cfg(feature = "toggle")]
+                "/toggle" => {
+                    if !self.config.enable_remote_toggle {
+                        self.generate_error_disabled("remote toggle")
+                    } else {
+                        self.generate_toggle()
+                    }
+                },
+                
+                // Die
+                #[cfg(feature = "graceful-termination")]
+                "/die" => self.generate_die(),
+
+                _ => self.generate_404_page(),
+            };
+            (html, 200, "text/html; charset=utf-8")
+        };
+
+        let mut response = HttpResponse::with_status(status_code as u16, "OK");
+        response.set_header("Content-Type", content_type);
+        response.set_body(html.into_bytes());
+        response
+    }
+
+    /// Internal version of show-request
+    fn generate_show_request_direct(&self, req: &HttpRequest) -> String {
+        let mut html = String::new();
+        let _ = write!(html, "<!DOCTYPE html><html><head><title>Show Request</title></head><body>");
+        let _ = write!(html, "<h1>Request Received:</h1><pre>{}</pre>", req.cmd);
+        let _ = write!(html, "<h2>Headers:</h2><ul>");
+        for (n, v) in &req.headers {
+            let _ = write!(html, "<li><b>{}:</b> {}</li>", n, v);
+        }
+        let _ = write!(html, "</ul></body></html>");
+        html
+    }
+
+    /// Internal version of show-url-info
+    fn generate_show_url_info_direct(&self, _req: &HttpRequest) -> String {
+        // Simple mock for now
+        self.generate_simple_page("URL Info", "URL information features are currently being synchronized.")
+    }
+
+
+
 
     /// Load a template file from the templates directory
     /// Handles comment lines (starting with #) and #include directives

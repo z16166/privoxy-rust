@@ -1,0 +1,1045 @@
+commit 59d0012afef8d4fcc6e4eaecc9b782dbf8bcd744
+Author: zhangbo <zhangbo@gmail.com>
+Date:   Fri Mar 27 13:00:35 2026 +0800
+
+    Refine window restoration: only call SW_RESTORE if minimized (iconic)
+
+diff --git a/src/tray_icon.rs b/src/tray_icon.rs
+index 5e8f66e..cae31f2 100644
+--- a/src/tray_icon.rs
++++ b/src/tray_icon.rs
+@@ -43,7 +43,7 @@ use windows::core::{PCWSTR, w};
+ #[cfg(all(feature = "tray-icon", windows))]
+ use windows::Win32::Foundation::{HINSTANCE, HWND};
+ #[cfg(all(feature = "tray-icon", windows))]
+-use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE};
++use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE, IsIconic};
+ 
+ pub struct TrayIconApp {
+     config: Arc<Config>,
+@@ -154,8 +154,12 @@ impl TrayIconApp {
+                             unsafe {
+                                 if let Ok(hwnd) = FindWindowW(None, w!("Privoxy")) {
+                                     if !hwnd.is_invalid() {
+-                                        // Restore if minimized, and bring to front
+-                                        let _ = ShowWindow(hwnd, SW_RESTORE);
++                                        // Restore only if currently minimized (iconic)
++                                        if IsIconic(hwnd).as_bool() {
++                                            let _ = ShowWindow(hwnd, SW_RESTORE);
++                                        }
++                                        
++                                        // Always bring to front
+                                         let _ = SetForegroundWindow(hwnd);
+                                     }
+                                 }
+
+commit 12ac1a2e49e22477e48b087582d6477793c5d5e6
+Author: zhangbo <zhangbo@gmail.com>
+Date:   Fri Mar 27 12:56:58 2026 +0800
+
+    Restore and focus window: handle minimized state using SW_RESTORE
+
+diff --git a/src/tray_icon.rs b/src/tray_icon.rs
+index f98cbc2..5e8f66e 100644
+--- a/src/tray_icon.rs
++++ b/src/tray_icon.rs
+@@ -43,7 +43,7 @@ use windows::core::{PCWSTR, w};
+ #[cfg(all(feature = "tray-icon", windows))]
+ use windows::Win32::Foundation::{HINSTANCE, HWND};
+ #[cfg(all(feature = "tray-icon", windows))]
+-use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow};
++use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE};
+ 
+ pub struct TrayIconApp {
+     config: Arc<Config>,
+@@ -154,6 +154,8 @@ impl TrayIconApp {
+                             unsafe {
+                                 if let Ok(hwnd) = FindWindowW(None, w!("Privoxy")) {
+                                     if !hwnd.is_invalid() {
++                                        // Restore if minimized, and bring to front
++                                        let _ = ShowWindow(hwnd, SW_RESTORE);
+                                         let _ = SetForegroundWindow(hwnd);
+                                     }
+                                 }
+
+commit 3829c0817ce28d9b3a7a1d4be76e17cfe54deda6
+Author: zhangbo <zhangbo@gmail.com>
+Date:   Fri Mar 27 12:53:48 2026 +0800
+
+    Implement foreground window focus: bring window to front when requested
+
+diff --git a/src/tray_icon.rs b/src/tray_icon.rs
+index d907894..f98cbc2 100644
+--- a/src/tray_icon.rs
++++ b/src/tray_icon.rs
+@@ -39,9 +39,11 @@ use libui::controls::{VerticalBox, MultilineEntry, LayoutStrategy, TextEntry};
+ use libui::menus::Menu;
+ 
+ #[cfg(all(feature = "tray-icon", windows))]
+-use windows::core::PCWSTR;
++use windows::core::{PCWSTR, w};
+ #[cfg(all(feature = "tray-icon", windows))]
+-use windows::Win32::Foundation::HINSTANCE;
++use windows::Win32::Foundation::{HINSTANCE, HWND};
++#[cfg(all(feature = "tray-icon", windows))]
++use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow};
+ 
+ pub struct TrayIconApp {
+     config: Arc<Config>,
+@@ -146,6 +148,16 @@ impl TrayIconApp {
+                     if let Some(ref mut gui_handles) = cache.1 {
+                         if let Some(ref mut window) = gui_handles.window {
+                             window.show();
++                            
++                            // Bring to foreground on Windows
++                            #[cfg(windows)]
++                            unsafe {
++                                if let Ok(hwnd) = FindWindowW(None, w!("Privoxy")) {
++                                    if !hwnd.is_invalid() {
++                                        let _ = SetForegroundWindow(hwnd);
++                                    }
++                                }
++                            }
+                         }
+                     }
+                 }
+
+commit 5bf2e9f2c708979358afe70d7303bbc9c043c2d6
+Author: zhangbo <zhangbo@gmail.com>
+Date:   Fri Mar 27 12:46:31 2026 +0800
+
+    Implement click distinction: left-click shows window, right-click shows menu
+
+diff --git a/src/tray_icon.rs b/src/tray_icon.rs
+index e368a36..d907894 100644
+--- a/src/tray_icon.rs
++++ b/src/tray_icon.rs
+@@ -62,6 +62,8 @@ pub struct TrayIconApp {
+     icon_manager: Option<IconManager>,
+     current_frame: usize,
+     tray_icon: Option<tray_icon::TrayIcon>,
++    #[cfg(feature = "tray-icon")]
++    menu: Option<TrayMenu>,
+     pub ui_handles: Option<logger::UiLogHandles>,
+     pub clear_log_item_libui: Option<SendMenuItem>,
+ }
+@@ -127,6 +129,8 @@ impl TrayIconApp {
+             icon_manager,
+             current_frame: 0,
+             tray_icon: None,
++            #[cfg(feature = "tray-icon")]
++            menu: None,
+             ui_handles: None,
+             clear_log_item_libui: None,
+         }
+@@ -456,6 +460,9 @@ impl TrayIconApp {
+             &menu_item_toggle,
+         ]).map_err(|e| PrivoxyError::Other(format!("Menu error: {}", e)))?;
+ 
++        // Store menu for dynamic attachment
++        self.menu = Some(menu.clone());
++
+         // Load icon from embedded resource or file
+         let icon = load_icon().map_err(|e| PrivoxyError::Other(format!("Failed to load icon: {}", e)))?;
+ 
+@@ -484,13 +491,10 @@ impl TrayIconApp {
+         // Clone config for use in the event loop
+         let config = self.config.clone();
+ 
+-        // Create tray icon before starting event loop
+-        // On Windows and Linux, this is fine to do before the event loop starts
+-        // On macOS, we need to create it after the event loop is running
++        // Create tray icon WITHOUT initial menu
+         #[cfg(not(target_os = "macos"))]
+         {
+             let tray_icon = TrayIconBuilder::new()
+-                .with_menu(Box::new(menu.clone()))
+                 .with_tooltip("Privoxy - Web Proxy")
+                 .with_icon(icon.clone())
+                 .build();
+@@ -559,11 +563,24 @@ impl TrayIconApp {
+                 std::process::exit(0);
+             }
+             
+-            // Check for tray icon events (e.g. left click to show window)
++            // Check for tray icon events
+             if let Ok(tray_event) = TrayIconEvent::receiver().try_recv() {
+-                if let TrayIconEvent::Click { button: MouseButton::Left, .. } = tray_event {
+-                    info!("Tray icon left clicked - showing window");
+-                    self.show_window();
++                match tray_event {
++                    TrayIconEvent::Click { button: MouseButton::Left, .. } => {
++                        info!("Tray icon left clicked - showing window");
++                        // Ensure menu is not attached during left click
++                        if let Some(icon) = &self.tray_icon {
++                            icon.set_menu(None);
++                        }
++                        self.show_window();
++                    }
++                    TrayIconEvent::Click { button: MouseButton::Right, .. } => {
++                        info!("Tray icon right clicked - attaching menu");
++                        if let (Some(icon), Some(menu)) = (&self.tray_icon, &self.menu) {
++                            icon.set_menu(Some(Box::new(menu.clone())));
++                        }
++                    }
++                    _ => {}
+                 }
+             }
+             
+
+commit 616dc359536b2a6867a5e625e55972f3c0dadaf1
+Author: zhangbo <zhangbo@gmail.com>
+Date:   Fri Mar 27 12:39:06 2026 +0800
+
+    Stabilize Privoxy Rust GUI for Windows: thread-safety fixes, visibility restoration, and clean build output
+
+diff --git a/src/tray_icon.rs b/src/tray_icon.rs
+index 42b4de6..e368a36 100644
+--- a/src/tray_icon.rs
++++ b/src/tray_icon.rs
+@@ -12,9 +12,19 @@ use tracing::{info, error, warn, debug};
+ #[cfg(feature = "tray-icon")]
+ use tray_icon::{
+     menu::{Menu as TrayMenu, MenuEvent, MenuItem as TrayMenuItem, PredefinedMenuItem, Submenu},
+-    TrayIconBuilder,
++    TrayIconBuilder, TrayIconEvent, MouseButton,
+ };
+ 
++/// Wrapper to allow sending libui MenuItem across threads.
++/// SAFETY: This must only be used from the UI thread.
++#[cfg(feature = "tray-icon")]
++#[derive(Clone)]
++pub(crate) struct SendMenuItem(pub(crate) libui::menus::MenuItem);
++#[cfg(feature = "tray-icon")]
++unsafe impl Send for SendMenuItem {}
++#[cfg(feature = "tray-icon")]
++unsafe impl Sync for SendMenuItem {}
++
+ #[cfg(feature = "tray-icon")]
+ use winit::event_loop::EventLoop;
+ 
+@@ -32,6 +42,7 @@ use libui::menus::Menu;
+ use windows::core::PCWSTR;
+ #[cfg(all(feature = "tray-icon", windows))]
+ use windows::Win32::Foundation::HINSTANCE;
++
+ pub struct TrayIconApp {
+     config: Arc<Config>,
+     state: Arc<AppState>,
+@@ -51,6 +62,8 @@ pub struct TrayIconApp {
+     icon_manager: Option<IconManager>,
+     current_frame: usize,
+     tray_icon: Option<tray_icon::TrayIcon>,
++    pub ui_handles: Option<logger::UiLogHandles>,
++    pub clear_log_item_libui: Option<SendMenuItem>,
+ }
+ 
+ #[cfg(feature = "tray-icon")]
+@@ -114,40 +127,52 @@ impl TrayIconApp {
+             icon_manager,
+             current_frame: 0,
+             tray_icon: None,
++            ui_handles: None,
++            clear_log_item_libui: None,
+         }
+     }
+ 
+     fn show_window(&mut self) {
+-        // Find existing UI handles in the log cache
+-        if let Ok(cache) = self.log_cache.lock() {
+-            if let Some(ref ui_handles) = cache.1 {
+-                info!("Found existing UI window, showing it");
+-                let mut window = ui_handles.window.clone();
+-                ui_handles.ui.queue_main(move || {
+-                    window.show();
+-                });
+-                return;
+-            }
++        if let Some(ref handles) = self.ui_handles {
++            let event_queue = handles.event_queue.clone();
++            let log_cache = self.log_cache.clone();
++            
++            event_queue.queue_main(move || {
++                if let Ok(mut cache) = log_cache.lock() {
++                    if let Some(ref mut gui_handles) = cache.1 {
++                        if let Some(ref mut window) = gui_handles.window {
++                            window.show();
++                        }
++                    }
++                }
++            });
++            return;
+         }
+         
+-        // If not found, fall back to starting the UI thread
+-        info!("Starting new UI thread (fallback)");
+-        let log_cache = self.log_cache.clone();
++        info!("Starting new UI thread (persistent)");
++        let (ui_tx, ui_rx) = std::sync::mpsc::channel::<(Arc<libui::EventQueue>, SendMenuItem)>();
++        let log_cache_thread = self.log_cache.clone();
+         let shutdown_sender_arc = self.shutdown_sender.clone();
+         let visible_on_start = self.show_window;
++        let config = self.config.clone();
+         
+         let thread = std::thread::spawn(move || {
+-            // Initialize libui
+-            let ui = UI::init().expect("Failed to initialize UI");
++            let ui = match UI::init() {
++                Ok(ui) => ui,
++                Err(e) => {
++                    error!("Failed to initialize UI: {}", e);
++                    return;
++                }
++            };
+             
+-            // --- Step 1: Define global menus before creating window ---
+-            // File menu
++            // Hidden dummy window to keep thread alive
++            let mut dummy = libui::controls::Window::new(&ui, "Privoxy Service", 1, 1, WindowType::NoMenubar);
++            dummy.hide();
++            
++            // --- Global Menu Setup ---
++            // File Menu
+             let file_menu = Menu::new("File");
+-            let show_window_item = file_menu.append_item("Show Window");
+-            show_window_item.on_clicked(|_, _| {
+-                info!("File -> Show Window clicked");
+-                // Window is already shown, just bring to front if needed
+-            });
++            file_menu.append_item("Show Window");
+             file_menu.append_separator();
+             let exit_item = file_menu.append_item("Exit");
+             let shutdown_sender_ui = shutdown_sender_arc.clone();
+@@ -161,322 +186,105 @@ impl TrayIconApp {
+                 std::process::exit(0);
+             });
+             
+-            // View menu - create items first to get references
++            // View Menu
+             let view_menu = Menu::new("View");
+             let clear_log_item = view_menu.append_item("Clear Log");
+             
+-            // Tools menu
++            // Tools Menu
+             let tools_menu = Menu::new("Tools");
+-            let edit_config_item = tools_menu.append_item("Edit Config");
+-            edit_config_item.on_clicked(|_, _| {
+-                info!("Tools -> Edit Config clicked");
+-                // Open config file with default editor
+-                let config_path = "config.txt";
+-                #[cfg(target_os = "windows")]
+-                let _ = std::process::Command::new("notepad.exe")
+-                    .arg(config_path)
+-                    .spawn();
+-                #[cfg(target_os = "macos")]
+-                let _ = std::process::Command::new("open")
+-                    .arg("-a")
+-                    .arg("TextEdit")
+-                    .arg(config_path)
+-                    .spawn();
+-                #[cfg(target_os = "linux")]
+-                let _ = std::process::Command::new("xdg-open")
+-                    .arg(config_path)
+-                    .spawn();
++            let config_clone = config.clone();
++            tools_menu.append_item("Edit Config").on_clicked(move |_, _| {
++                if let Some(path) = &config_clone.config_file {
++                    let _ = opener::open(path);
++                }
+             });
+-            let mut edit_default_actions_item = tools_menu.append_item("Edit Default Actions");
+-            edit_default_actions_item.on_clicked(|_, _| {
+-                info!("Tools -> Edit Default Actions clicked");
+-                // Open default.action file
+-                let file_path = "default.action";
+-                #[cfg(target_os = "windows")]
+-                let _ = std::process::Command::new("notepad.exe")
+-                    .arg(file_path)
+-                    .spawn();
+-                #[cfg(target_os = "macos")]
+-                let _ = std::process::Command::new("open")
+-                    .arg("-a")
+-                    .arg("TextEdit")
+-                    .arg(file_path)
+-                    .spawn();
+-                #[cfg(target_os = "linux")]
+-                let _ = std::process::Command::new("xdg-open")
+-                    .arg(file_path)
+-                    .spawn();
++            
++            let config_clone = config.clone();
++            tools_menu.append_item("Edit Default Actions").on_clicked(move |_, _| {
++                if let Some(ref confdir) = config_clone.confdir {
++                    let path = confdir.join("default.action");
++                    let _ = opener::open(path);
++                }
+             });
+-            let mut edit_user_actions_item = tools_menu.append_item("Edit User Actions");
+-            edit_user_actions_item.on_clicked(|_, _| {
+-                info!("Tools -> Edit User Actions clicked");
+-                // Open user.action file
+-                let file_path = "user.action";
+-                #[cfg(target_os = "windows")]
+-                let _ = std::process::Command::new("notepad.exe")
+-                    .arg(file_path)
+-                    .spawn();
+-                #[cfg(target_os = "macos")]
+-                let _ = std::process::Command::new("open")
+-                    .arg("-a")
+-                    .arg("TextEdit")
+-                    .arg(file_path)
+-                    .spawn();
+-                #[cfg(target_os = "linux")]
+-                let _ = std::process::Command::new("xdg-open")
+-                    .arg(file_path)
+-                    .spawn();
++            
++            let config_clone = config.clone();
++            tools_menu.append_item("Edit User Actions").on_clicked(move |_, _| {
++                if let Some(ref confdir) = config_clone.confdir {
++                    let path = confdir.join("user.action");
++                    let _ = opener::open(path);
++                }
+             });
+-            let mut edit_default_filters_item = tools_menu.append_item("Edit Default Filters");
+-            edit_default_filters_item.on_clicked(|_, _| {
+-                info!("Tools -> Edit Default Filters clicked");
+-                // Open default.filter file
+-                let file_path = "default.filter";
+-                #[cfg(target_os = "windows")]
+-                let _ = std::process::Command::new("notepad.exe")
+-                    .arg(file_path)
+-                    .spawn();
+-                #[cfg(target_os = "macos")]
+-                let _ = std::process::Command::new("open")
+-                    .arg("-a")
+-                    .arg("TextEdit")
+-                    .arg(file_path)
+-                    .spawn();
+-                #[cfg(target_os = "linux")]
+-                let _ = std::process::Command::new("xdg-open")
+-                    .arg(file_path)
+-                    .spawn();
++            
++            let config_clone = config.clone();
++            tools_menu.append_item("Edit Default Filters").on_clicked(move |_, _| {
++                if let Some(ref confdir) = config_clone.confdir {
++                    let path = confdir.join("default.filter");
++                    let _ = opener::open(path);
++                }
+             });
+-            let mut edit_user_filters_item = tools_menu.append_item("Edit User Filters");
+-            edit_user_filters_item.on_clicked(|_, _| {
+-                info!("Tools -> Edit User Filters clicked");
+-                // Open user.filter file
+-                let file_path = "user.filter";
+-                #[cfg(target_os = "windows")]
+-                let _ = std::process::Command::new("notepad.exe")
+-                    .arg(file_path)
+-                    .spawn();
+-                #[cfg(target_os = "macos")]
+-                let _ = std::process::Command::new("open")
+-                    .arg("-a")
+-                    .arg("TextEdit")
+-                    .arg(file_path)
+-                    .spawn();
+-                #[cfg(target_os = "linux")]
+-                let _ = std::process::Command::new("xdg-open")
+-                    .arg(file_path)
+-                    .spawn();
++            
++            let config_clone = config.clone();
++            tools_menu.append_item("Edit User Filters").on_clicked(move |_, _| {
++                if let Some(ref confdir) = config_clone.confdir {
++                    let path = confdir.join("user.filter");
++                    let _ = opener::open(path);
++                }
+             });
++            
+             #[cfg(feature = "trust")]
+             {
+-                let mut edit_trust_item = tools_menu.append_item("Edit Trust");
+-                edit_trust_item.on_clicked(|_, _| {
+-                    info!("Tools -> Edit Trust clicked");
+-                    // Open trust file
+-                    let file_path = "trust";
+-                    #[cfg(target_os = "windows")]
+-                    let _ = std::process::Command::new("notepad.exe")
+-                        .arg(file_path)
+-                        .spawn();
+-                    #[cfg(target_os = "macos")]
+-                    let _ = std::process::Command::new("open")
+-                        .arg("-a")
+-                        .arg("TextEdit")
+-                        .arg(file_path)
+-                        .spawn();
+-                    #[cfg(target_os = "linux")]
+-                    let _ = std::process::Command::new("xdg-open")
+-                        .arg(file_path)
+-                        .spawn();
++                let config_clone = config.clone();
++                tools_menu.append_item("Edit Trust").on_clicked(move |_, _| {
++                    if let Some(ref confdir) = config_clone.confdir {
++                        let path = confdir.join("trust");
++                        let _ = opener::open(path);
++                    }
+                 });
+             }
+-            
+-            // Help menu
++
++            // Help Menu
+             let help_menu = Menu::new("Help");
+-            let mut gpl_item = help_menu.append_item("GPL");
+-            gpl_item.on_clicked(|_, _| {
+-                info!("Help -> GPL clicked");
+-                let gpl_url = "https://www.gnu.org/copyleft/gpl.html";
+-                #[cfg(target_os = "windows")]
+-                let _ = std::process::Command::new("cmd.exe")
+-                    .args(["/c", "start", gpl_url])
+-                    .spawn();
+-                #[cfg(target_os = "macos")]
+-                let _ = std::process::Command::new("open")
+-                    .arg(gpl_url)
+-                    .spawn();
+-                #[cfg(target_os = "linux")]
+-                let _ = std::process::Command::new("xdg-open")
+-                    .arg(gpl_url)
+-                    .spawn();
++            help_menu.append_item("Status").on_clicked(|_, _| {
++                let _ = opener::open("http://config.privoxy.org/show-status");
+             });
+-            let mut faq_item = help_menu.append_item("FAQ");
+-            faq_item.on_clicked(|_, _| {
+-                info!("Help -> FAQ clicked");
+-                let faq_url = "https://www.privoxy.org/faq/";
+-                #[cfg(target_os = "windows")]
+-                let _ = std::process::Command::new("cmd.exe")
+-                    .args(["/c", "start", faq_url])
+-                    .spawn();
+-                #[cfg(target_os = "macos")]
+-                let _ = std::process::Command::new("open")
+-                    .arg(faq_url)
+-                    .spawn();
+-                #[cfg(target_os = "linux")]
+-                let _ = std::process::Command::new("xdg-open")
+-                    .arg(faq_url)
+-                    .spawn();
++            help_menu.append_item("FAQ").on_clicked(|_, _| {
++                let _ = opener::open("https://www.privoxy.org/faq/");
+             });
+-            let mut manual_item = help_menu.append_item("Manual");
+-            manual_item.on_clicked(|_, _| {
+-                info!("Help -> Manual clicked");
+-                let manual_url = "https://www.privoxy.org/user-manual/";
+-                #[cfg(target_os = "windows")]
+-                let _ = std::process::Command::new("cmd.exe")
+-                    .args(["/c", "start", manual_url])
+-                    .spawn();
+-                #[cfg(target_os = "macos")]
+-                let _ = std::process::Command::new("open")
+-                    .arg(manual_url)
+-                    .spawn();
+-                #[cfg(target_os = "linux")]
+-                let _ = std::process::Command::new("xdg-open")
+-                    .arg(manual_url)
+-                    .spawn();
++            help_menu.append_item("Manual").on_clicked(|_, _| {
++                let _ = opener::open("https://www.privoxy.org/user-manual/");
+             });
+-            let mut status_item = help_menu.append_item("Status");
+-            status_item.on_clicked(|_, _| {
+-                info!("Help -> Status clicked");
+-                let status_url = "http://localhost:8119/show-status";
+-                #[cfg(target_os = "windows")]
+-                let _ = std::process::Command::new("cmd.exe")
+-                    .args(["/c", "start", status_url])
+-                    .spawn();
+-                #[cfg(target_os = "macos")]
+-                let _ = std::process::Command::new("open")
+-                    .arg(status_url)
+-                    .spawn();
+-                #[cfg(target_os = "linux")]
+-                let _ = std::process::Command::new("xdg-open")
+-                    .arg(status_url)
+-                    .spawn();
++            help_menu.append_item("GPL").on_clicked(|_, _| {
++                let _ = opener::open("https://www.gnu.org/copyleft/gpl.html");
+             });
+-            let mut about_item = help_menu.append_item("About");
+-            about_item.on_clicked(|_, _| {
++            help_menu.append_separator();
++            help_menu.append_item("About").on_clicked(|_, _| {
+                 info!("Help -> About clicked");
+-                MessageDialog::new()
++                let dialog = rfd::MessageDialog::new()
+                     .set_title("About Privoxy")
+-                    .set_description(&format!("Privoxy version {} for Windows
+-Copyright (C) 2000-2024 the Privoxy Team (https://www.privoxy.org/)
+-Based on the Internet Junkbuster by Junkbusters Corp.
+-This is free software; it may be used and copied under the
+-GNU General Public License, version 2: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+-This program comes with ABSOLUTELY NO WARRANTY OF ANY KIND.", crate::constants::VERSION))
+-                    .set_buttons(rfd::MessageButtons::Ok)
+-                    .show();
++                    .set_description("Privoxy Rust implementation\nVersion 4.1.0\n\nCopyright (C) 2024 The Privoxy Team");
++                dialog.show();
+             });
+             
+-            // --- Step 2: Create window with menubar enabled ---
+-            // Window size with golden ratio (1.618:1)
+-            // Width: 2430, Height: 1500 (Doubled from 1215x750)
+-            let mut window = Window::new(&ui, "Privoxy", 2430, 1500, WindowType::HasMenubar);
+-            
+-            // Create vertical box
+-            let mut vbox = VerticalBox::new();
+-            vbox.set_padded(true);
++            // Send handles back to main thread
++            let _ = ui_tx.send((Arc::new(ui.event_queue()), SendMenuItem(clear_log_item.clone())));
+             
+-            // Create log textarea
+-            let mut log_textarea = MultilineEntry::new();
+-            log_textarea.set_readonly(true);
++            // Initial window setup
++            setup_log_window(&ui, &log_cache_thread, &SendMenuItem(clear_log_item), visible_on_start);
+             
+-            // Add cached logs to textarea
+-            if let Ok(cache) = log_cache.lock() {
+-                #[cfg(feature = "tray-icon")]
+-                {
+-                    for message in cache.0.iter() {
+-                        log_textarea.append(message);
+-                        log_textarea.append("\n");
+-                    }
+-                }
+-                #[cfg(not(feature = "tray-icon"))]
+-                {
+-                    for message in cache.iter() {
+-                        log_textarea.append(message);
+-                        log_textarea.append("\n");
+-                    }
+-                }
+-            }
+-            
+-            // Clone the handle before moving into vbox
+-            // This creates a second "remote control" pointing to the same UI control
+-            let mut log_textarea_handle = log_textarea.clone();
+-            
+-            // Add textarea to box (log_textarea ownership is moved here)
+-            vbox.append(log_textarea, LayoutStrategy::Stretchy);
+-            
+-            // Set window content
+-            window.set_child(vbox);
+-            
+-            // Show window initially (optional, user said it should show on first click)
+-            if visible_on_start {
+-                window.show();
+-            } else {
+-                window.hide();
+-            }
+-            
+-            // Handle window closing: hide instead of destroy
+-            let mut window_clone = window.clone();
+-            window.on_closing(&ui, move |_| {
+-                info!("Log window closing, hiding instead");
+-                window_clone.hide();
+-            });
+-            
+-            // Store UI handles in log cache for real-time updates
+-            {
+-                if let Ok(mut cache) = log_cache.lock() {
+-                    #[cfg(feature = "tray-icon")]
+-                    {
+-                        cache.1 = Some(logger::UiLogHandles {
+-                            ui: ui.clone(),
+-                            window: window.clone(),
+-                            log_textarea: log_textarea_handle.clone(),
+-                        });
+-                    }
+-                }
+-            }
+-            
+-            // Now set up the Clear Log menu handler using the cloned handle
+-            clear_log_item.on_clicked({
+-                let log_cache = log_cache.clone();
+-                move |_, _| {
+-                    info!("View -> Clear Log clicked");
+-                    
+-                    {
+-                        // Clear the log cache - release lock BEFORE any logging
+-                        if let Ok(mut cache) = log_cache.lock() {
+-                            #[cfg(feature = "tray-icon")]
+-                            {
+-                                cache.0.clear();
+-                            }
+-                            #[cfg(not(feature = "tray-icon"))]
+-                            {
+-                                cache.clear();
+-                            }
+-                        }
+-                    }
+-                    info!("Log cache cleared");
+-                    
+-                    // Clear the UI textarea using the cloned handle
+-                    log_textarea_handle.set_value("");
+-                    info!("Log textarea cleared in real-time");
+-                }
+-            });
+-            
+-            // Start UI event loop
++            info!("UI thread entering persistent main loop");
+             ui.main();
+         });
+         
+-        // Store the thread handle
++        // Block main thread briefly to get the UI handle (only happens once at start)
++        if let Ok((event_queue, clear_item)) = ui_rx.recv() {
++            self.ui_handles = Some(logger::UiLogHandles {
++                event_queue: event_queue.clone(),
++                window: None,
++                log_textarea: None,
++            });
++            self.clear_log_item_libui = Some(clear_item);
++        }
++        
+         self.window_thread = Some(thread);
+     }
+ 
+@@ -553,104 +361,7 @@ This program comes with ABSOLUTELY NO WARRANTY OF ANY KIND.", crate::constants::
+         let submenu_file = Submenu::with_items(
+             "File",
+             true,
+-            &[
+-                &menu_item_show_window,
+-                &PredefinedMenuItem::separator(),
+-                &menu_item_exit,
+-            ],
+-        ).map_err(|e| PrivoxyError::Other(format!("Menu error: {}", e)))?;
+-        
+-        // Create menu items for View submenu
+-        let menu_item_clear_log = TrayMenuItem::new("Clear Log", true, None);
+-        let menu_item_log_messages = TrayMenuItem::new("Log Messages", true, None);
+-        let menu_item_message_highlighting = TrayMenuItem::new("Message Highlighting", true, None);
+-        let menu_item_limit_buffer_size = TrayMenuItem::new("Limit Buffer Size", true, None);
+-        let menu_item_activity_animation = TrayMenuItem::new("Activity Animation", true, None);
+-        
+-        // Create View submenu
+-        let submenu_view = Submenu::with_items(
+-            "View",
+-            true,
+-            &[
+-                &menu_item_clear_log,
+-                &menu_item_log_messages,
+-                &menu_item_message_highlighting,
+-                &menu_item_limit_buffer_size,
+-                &menu_item_activity_animation,
+-            ],
+-        ).map_err(|e| PrivoxyError::Other(format!("Menu error: {}", e)))?;
+-        
+-        // Create menu items for Tools submenu
+-        let menu_item_edit_config = TrayMenuItem::new("Edit Config", true, None);
+-        let menu_item_edit_default_actions = TrayMenuItem::new("Edit Default Actions", true, None);
+-        let menu_item_edit_user_actions = TrayMenuItem::new("Edit User Actions", true, None);
+-        let menu_item_edit_default_filters = TrayMenuItem::new("Edit Default Filters", true, None);
+-        let menu_item_edit_user_filters = TrayMenuItem::new("Edit User Filters", true, None);
+-        
+-        // Create Tools submenu with optional Edit Trust item
+-        #[cfg(feature = "trust")]
+-        let menu_item_edit_trust = TrayMenuItem::new("Edit Trust", true, None);
+-        
+-        #[cfg(feature = "trust")]
+-        let submenu_tools = Submenu::with_items(
+-            "Tools",
+-            true,
+-            &[
+-                &menu_item_edit_config,
+-                &menu_item_edit_default_actions,
+-                &menu_item_edit_user_actions,
+-                &menu_item_edit_default_filters,
+-                &menu_item_edit_user_filters,
+-                &menu_item_edit_trust,
+-            ],
+-        ).map_err(|e| PrivoxyError::Other(format!("Menu error: {}", e)))?;
+-        
+-        #[cfg(not(feature = "trust"))]
+-        let submenu_tools = Submenu::with_items(
+-            "Tools",
+-            true,
+-            &[
+-                &menu_item_edit_config,
+-                &menu_item_edit_default_actions,
+-                &menu_item_edit_user_actions,
+-                &menu_item_edit_default_filters,
+-                &menu_item_edit_user_filters,
+-            ],
+-        ).map_err(|e| PrivoxyError::Other(format!("Menu error: {}", e)))?;
+-        
+-        // Create menu items for Help submenu
+-        let menu_item_status = TrayMenuItem::new("Status", true, None);
+-        let menu_item_faq = TrayMenuItem::new("FAQ", true, None);
+-        let menu_item_manual = TrayMenuItem::new("Manual", true, None);
+-        let menu_item_gpl = TrayMenuItem::new("GPL", true, None);
+-        let menu_item_about = TrayMenuItem::new("About", true, None);
+-        
+-        // Create Help submenu
+-        let submenu_help = Submenu::with_items(
+-            "Help",
+-            true,
+-            &[
+-                &menu_item_status,
+-                &menu_item_faq,
+-                &menu_item_manual,
+-                &menu_item_gpl,
+-                &PredefinedMenuItem::separator(),
+-                &menu_item_about,
+-            ],
+-        ).map_err(|e| PrivoxyError::Other(format!("Menu error: {}", e)))?;
+-        
+-        // Create top-level Toggle Enabled menu item
+-        let menu_item_toggle = TrayMenuItem::new("Toggle Enabled", true, None);
+-        
+-        // Create File submenu
+-        let submenu_file = Submenu::with_items(
+-            "File",
+-            true,
+-            &[
+-                &menu_item_show_window,
+-                &PredefinedMenuItem::separator(),
+-                &menu_item_exit,
+-            ],
++            &[&menu_item_show_window, &PredefinedMenuItem::separator(), &menu_item_exit],
+         ).map_err(|e| PrivoxyError::Other(format!("Menu error: {}", e)))?;
+         
+         // Create menu items for View submenu
+@@ -848,44 +559,43 @@ This program comes with ABSOLUTELY NO WARRANTY OF ANY KIND.", crate::constants::
+                 std::process::exit(0);
+             }
+             
++            // Check for tray icon events (e.g. left click to show window)
++            if let Ok(tray_event) = TrayIconEvent::receiver().try_recv() {
++                if let TrayIconEvent::Click { button: MouseButton::Left, .. } = tray_event {
++                    info!("Tray icon left clicked - showing window");
++                    self.show_window();
++                }
++            }
++            
+             // Check for menu events
+             if let Ok(event) = MenuEvent::receiver().try_recv() {
+                 let event_id = &event.id;
+                 if event_id == &show_window_id {
+-                    // Show log window
+                     info!("Show window clicked");
+                     self.show_window();
+-                } else if event_id == &exit_id {
+-                    // Send shutdown signal and exit gracefully
+-                    info!("Exiting Privoxy");
+-                    if let Some(sender) = self.shutdown_sender.lock().unwrap().take() {
+-                        let _ = sender.send(());
+-                    }
+-                    // Exit the event loop
+-                    std::process::exit(0);
+                 } else if event_id == &clear_log_id {
+-                    // Clear log
+                     info!("Tray -> Clear Log clicked");
+-                    let mut ui_handles = None;
+-                    
+-                    {
+-                        if let Ok(mut cache) = self.log_cache.lock() {
+-                            #[cfg(feature = "tray-icon")]
+-                            {
++                    let log_cache = self.log_cache.clone();
++                    if let Some(ref handles) = self.ui_handles {
++                        let event_queue = handles.event_queue.clone();
++                        event_queue.queue_main(move || {
++                            if let Ok(mut cache) = log_cache.lock() {
+                                 cache.0.clear();
+-                                ui_handles = cache.1.clone();
++                                if let Some(ref mut gui_handles) = cache.1 {
++                                    if let Some(ref mut textarea_wrap) = gui_handles.log_textarea {
++                                        let mut textarea_mut = textarea_wrap.clone();
++                                        textarea_mut.set_value("");
++                                    }
++                                }
+                             }
+-                        }
+-                    }
+-                    info!("Log cache cleared via tray");
+-                    
+-                    if let Some(handles) = ui_handles {
+-                        let mut textarea = handles.log_textarea.clone();
+-                        handles.ui.queue_main(move || {
+-                            textarea.set_value("");
+                         });
+-                        info!("Log textarea clear queued from tray thread");
+                     }
++                } else if event_id == &exit_id {
++                    info!("Exit clicked");
++                    if let Some(sender) = self.shutdown_sender.lock().unwrap().take() {
++                        let _ = sender.send(());
++                    }
++                    std::process::exit(0);
+                 } else if event_id == &log_messages_id {
+                     // Show log window
+                     info!("Log Messages clicked - showing window");
+@@ -902,6 +612,9 @@ This program comes with ABSOLUTELY NO WARRANTY OF ANY KIND.", crate::constants::
+                     // Toggle activity animation
+                     self.activity_animation = !self.activity_animation;
+                     info!("Activity animation {}", if self.activity_animation { "enabled" } else { "disabled" });
++                    
++                    // Update tray icon
++                    self.update_tray_icon();
+                 } else if event_id == &edit_config_id {
+                     // Open config file for editing
+                     if let Some(config_path) = &config.config_file {
+@@ -924,15 +637,31 @@ This program comes with ABSOLUTELY NO WARRANTY OF ANY KIND.", crate::constants::
+                 } else if event_id == &edit_default_actions_id {
+                     // Open default actions file for editing
+                     info!("Edit default actions clicked");
++                    if let Some(ref confdir) = config.confdir {
++                        let path = confdir.join("default.action");
++                        let _ = opener::open(path);
++                    }
+                 } else if event_id == &edit_user_actions_id {
+                     // Open user actions file for editing
+                     info!("Edit user actions clicked");
++                    if let Some(ref confdir) = config.confdir {
++                        let path = confdir.join("user.action");
++                        let _ = opener::open(path);
++                    }
+                 } else if event_id == &edit_default_filters_id {
+                     // Open default filters file for editing
+                     info!("Edit default filters clicked");
++                    if let Some(ref confdir) = config.confdir {
++                        let path = confdir.join("default.filter");
++                        let _ = opener::open(path);
++                    }
+                 } else if event_id == &edit_user_filters_id {
+                     // Open user filters file for editing
+                     info!("Edit user filters clicked");
++                    if let Some(ref confdir) = config.confdir {
++                        let path = confdir.join("user.filter");
++                        let _ = opener::open(path);
++                    }
+                 }
+                 // Handle Edit Trust menu item (only when trust feature is enabled)
+                 else if {
+@@ -943,6 +672,10 @@ This program comes with ABSOLUTELY NO WARRANTY OF ANY KIND.", crate::constants::
+                 } {
+                     // Open trust file for editing
+                     info!("Edit trust clicked");
++                    if let Some(ref confdir) = config.confdir {
++                        let path = confdir.join("trust");
++                        let _ = opener::open(path);
++                    }
+                 } else if event_id == &status_id {
+                     // Show status - open the status page in browser
+                     let status_url = "http://localhost:8119/show-status";
+@@ -1024,19 +757,13 @@ This program comes with ABSOLUTELY NO WARRANTY OF ANY KIND.", crate::constants::
+                     
+                     // Update tray icon to reflect new state
+                     self.update_tray_icon();
+-                } else if event_id == &activity_animation_id {
+-                    // Toggle activity animation
+-                    self.activity_animation = !self.activity_animation;
+-                    info!("Activity animation {}", if self.activity_animation { "enabled" } else { "disabled" });
+-                    
+-                    // Update tray icon
+-                    self.update_tray_icon();
+                 }
+             }
+         }).map_err(|e| PrivoxyError::Other(format!("Event loop error: {}", e)))?;
+ 
+         Ok(())
+     }
++
+ }
+ 
+ /// Icon manager for handling different icon states
+@@ -1217,6 +944,7 @@ impl IconManager {
+             // Try to load animated icons (IDI_ANIMATED1-8 = 201-208) from resources
+             let mut animated_icons = Vec::new();
+             for i in 1..=8 {
++                 // Icon loaded from resource
+                 if let Ok(icon) = load_icon_from_resource(200 + i) {
+                     info!("Successfully loaded animated icon {} from resource ID {}", i, 200 + i);
+                     animated_icons.push(icon);
+@@ -1469,6 +1197,72 @@ fn load_icon() -> Result<tray_icon::Icon, Box<dyn std::error::Error>> {
+     Ok(icon)
+ }
+ 
++/// Helper function to setup or recreate the log window on the UI thread
++#[cfg(feature = "tray-icon")]
++fn setup_log_window(ui: &UI, log_cache: &logger::LogCache, clear_log_item: &SendMenuItem, visible: bool) {
++    info!("Setting up log window (visible: {})", visible);
++    let mut window = Window::new(ui, "Privoxy", 1500, 1000, WindowType::HasMenubar);
++    
++    let mut vbox = VerticalBox::new();
++    vbox.set_padded(true);
++    
++    let mut log_textarea = MultilineEntry::new();
++    log_textarea.set_readonly(true);
++    
++    // Add cached logs to textarea
++    let logs_to_append = {
++        if let Ok(cache) = log_cache.lock() {
++            cache.0.clone()
++        } else {
++            Vec::new()
++        }
++    };
++    for msg in logs_to_append {
++        log_textarea.append(&msg);
++        log_textarea.append("\n");
++    }
++    
++    let log_textarea_handle = log_textarea.clone();
++    vbox.append(log_textarea, LayoutStrategy::Stretchy);
++    window.set_child(vbox);
++    
++    if visible {
++        window.show();
++    } else {
++        window.hide();
++    }
++    
++    // Handle window closing: hide it, but keep handles to show it later
++    window.on_closing(ui, move |w| {
++        info!("Log window closing, hiding window");
++        w.hide();
++    });
++    
++    // Set the clear log handler
++    let log_cache_clear = log_cache.clone();
++    let mut log_textarea_clear = log_textarea_handle.clone();
++    let item_clone = clear_log_item.clone();
++    item_clone.0.on_clicked(move |_, _| {
++        info!("View -> Clear Log clicked");
++        if let Ok(mut cache) = log_cache_clear.lock() {
++            cache.0.clear();
++        }
++        log_textarea_clear.set_value("");
++    });
++
++    // Store UI handles in log cache
++    if let Ok(mut cache) = log_cache.lock() {
++        #[cfg(feature = "tray-icon")]
++        {
++            cache.1 = Some(logger::UiLogHandles {
++                event_queue: Arc::new(ui.event_queue()),
++                window: Some(window.clone()),
++                log_textarea: Some(log_textarea_handle.clone()),
++            });
++        }
++    }
++}
++
+ #[cfg(not(feature = "tray-icon"))]
+ pub struct TrayIconApp {
+     _config: Arc<Config>,
+@@ -1484,4 +1278,4 @@ impl TrayIconApp {
+     pub fn run(&mut self) -> PrivoxyResult<()> {
+         Ok(())
+     }
+-}
++}
+\ No newline at end of file

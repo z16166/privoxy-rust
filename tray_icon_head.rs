@@ -370,7 +370,6 @@ impl TrayIconApp {
                 if let Err(e) = writeln!(log_file, "{}", message) {
                     eprintln!("Failed to write to log file: {}", e);
                 }
-                let _ = log_file.flush();
             }
         }
     }
@@ -510,10 +509,35 @@ impl TrayIconApp {
         // Clone config for use in the event loop
         let config = self.config.clone();
 
-        let mut tray_icon_local: Option<tray_icon::TrayIcon> = None;
+        // Create tray icon WITHOUT initial menu
+        #[cfg(not(target_os = "macos"))]
+        {
+            let tray_icon = TrayIconBuilder::new()
+                .with_tooltip("Privoxy - Web Proxy")
+                .with_icon(icon.clone())
+                .build();
+            
+            match tray_icon {
+                Ok(icon) => {
+                    info!("Tray icon created successfully");
+                    self.tray_icon = Some(icon);
+                }
+                Err(e) => {
+                    error!("Failed to create tray icon: {}", e);
+                }
+            }
+        };
+        
+        #[cfg(target_os = "macos")]
+        let mut tray_icon: Option<tray_icon::TrayIcon> = None;
         
         // Cross-platform event loop using winit
         let event_loop = EventLoop::<()>::new().map_err(|e| PrivoxyError::Other(format!("Failed to create event loop: {}", e)))?;
+        
+        // On macOS, the tray icon must be created after the event loop is running
+        // We use a flag to track if the tray icon has been created
+        #[cfg(target_os = "macos")]
+        let mut tray_icon_created = false;
         
         // Create a channel to receive shutdown signal
         let (_shutdown_notify_tx, shutdown_notify_rx) = std::sync::mpsc::channel::<()>();
@@ -527,8 +551,9 @@ impl TrayIconApp {
         });
         
         event_loop.run(move |event, _| {
-            // Create tray icon after event loop is initialized for all platforms
-            if tray_icon_local.is_none() {
+            // On macOS, create tray icon after event loop is initialized
+            #[cfg(target_os = "macos")]
+            if tray_icon.is_none() {
                 if matches!(event, winit::event::Event::NewEvents(winit::event::StartCause::Init)) {
                     let tray_icon_result = TrayIconBuilder::new()
                         .with_menu(Box::new(menu.clone()))
@@ -538,12 +563,12 @@ impl TrayIconApp {
                     
                     match tray_icon_result {
                         Ok(t_icon) => {
-                            info!("Tray icon created successfully");
-                            tray_icon_local = Some(t_icon);
-                            self.tray_icon = Some(tray_icon_local.as_ref().unwrap().clone());
+                            info!("Tray icon created successfully on macOS");
+                            tray_icon = Some(t_icon);
+                            self.tray_icon = Some(t_icon);
                         }
                         Err(e) => {
-                            error!("Failed to create tray icon: {}", e);
+                            error!("Failed to create tray icon on macOS: {}", e);
                         }
                     }
                 }

@@ -1,0 +1,47 @@
+[DEBUG] EventLoop created, setting up run closure
+[DEBUG] Event received: NewEvents(Init)
+[DEBUG] NewEvents(Init) triggered.
+[DEBUG] Building tray icon.
+[DEBUG] Tray icon built successfully.
+[DEBUG] Event received: Resumed
+[DEBUG] Event received: AboutToWait
+[DEBUG] Event received: NewEvents(WaitCancelled { start: Instant { t: 291639.6823993s }, requested_resume: None })
+[DEBUG] Event received: DeviceEvent { device_id: DeviceId(DeviceId(65612)), event: Added }
+[DEBUG] Event received: DeviceEvent { device_id: DeviceId(DeviceId(65610)), event: Added }
+[DEBUG] Event received: DeviceEvent { device_id: DeviceId(DeviceId(65605)), event: Added }
+[DEBUG] EventLoop created, setting up run closure
+[DEBUG] Event received: NewEvents(Init)
+[DEBUG] NewEvents(Init) triggered.
+[DEBUG] Building tray icon.
+[DEBUG] Tray icon built successfully.
+[DEBUG] Event received: Resumed
+[DEBUG] Event received: AboutToWait
+[DEBUG] Event received: NewEvents(WaitCancelled { start: Instant { t: 291728.9502833s }, requested_resume: None })
+[DEBUG] Event received: DeviceEvent { device_id: DeviceId(DeviceId(65612)), event: Added }
+[DEBUG] Event received: DeviceEvent { device_id: DeviceId(DeviceId(65610)), event: Added }
+[DEBUG] Event received: DeviceEvent { device_id: DeviceId(DeviceId(65605)), event: Added }
+[DEBUG] Event received: DeviceEvent { device_id: DeviceId(DeviceId(65603)), event: Added }
+[DEBUG] EventLoop created, setting up run closure
+[DEBUG] Event received: NewEvents(Init)
+[DEBUG] NewEvents(Init) triggered.
+[DEBUG] Building tray icon.
+[DEBUG] Tray icon built successfully.
+[DEBUG] Event received: Resumed
+[DEBUG] Event received: AboutToWait
+[DEBUG] Event received: NewEvents(WaitCancelled { start: Instant { t: 291776.6723791s }, requested_resume: None })
+[DEBUG] Event received: DeviceEvent { device_id: DeviceId(DeviceId(65612)), event: Added }
+[DEBUG] Event received: DeviceEvent { device_id: DeviceId(DeviceId(65610)), event: Added }
+[DEBUG] Event received: DeviceEvent { device_id: DeviceId(DeviceId(65605)), event: Added }
+[DEBUG] Event received: DeviceEvent { device_id: DeviceId(DeviceId(65603)), event: Added }
+[DEBUG] EventLoop created, setting up run closure
+[DEBUG] Event received: NewEvents(Init)
+[DEBUG] NewEvents(Init) triggered.
+[DEBUG] Building tray icon.
+[DEBUG] Tray icon built successfully.
+[DEBUG] Event received: Resumed
+[DEBUG] Event received: AboutToWait
+[DEBUG] Event received: NewEvents(WaitCancelled { start: Instant { t: 291859.3936844s }, requested_resume: None })
+[DEBUG] Event received: DeviceEvent { device_id: DeviceId(DeviceId(65612)), event: Added }
+[DEBUG] Event received: DeviceEvent { device_id: DeviceId(DeviceId(65610)), event: Added }
+[DEBUG] Event received: DeviceEvent { device_id: DeviceId(DeviceId(65605)), event: Added }
+[DEBUG] Event received: DeviceEvent { device_id: DeviceId(DeviceId(65603)), event: Added }

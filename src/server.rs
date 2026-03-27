@@ -17,26 +17,31 @@ pub struct ProxyServer {
     config: ConfigRef,
     state: Arc<AppState>,
     listeners: Vec<TcpListener>,
+    cgi_handler: Arc<crate::cgi::CgiHandler>,
 }
 
 impl ProxyServer {
     pub fn new(config: Arc<Config>) -> PrivoxyResult<Self> {
         let config_ref = Arc::new(RwLock::new(config.as_ref().clone()));
         let state = Arc::new(AppState::new(config.clone()));
+        let cgi_handler = Arc::new(crate::cgi::CgiHandler::new(config.clone(), state.clone()));
 
         Ok(Self {
             config: config_ref,
             state,
             listeners: Vec::new(),
+            cgi_handler,
         })
     }
 
     pub fn new_with_state(config: Arc<Config>, state: Arc<AppState>) -> PrivoxyResult<Self> {
         let config_ref = Arc::new(RwLock::new(config.as_ref().clone()));
+        let cgi_handler = Arc::new(crate::cgi::CgiHandler::new(config.clone(), state.clone()));
         Ok(Self {
             config: config_ref,
             state,
             listeners: Vec::new(),
+            cgi_handler,
         })
     }
 
@@ -45,11 +50,16 @@ impl ProxyServer {
             let config_guard = config.read();
             Arc::new(AppState::new(Arc::new(config_guard.clone())))
         };
+        let cgi_handler = {
+            let config_guard = config.read();
+            Arc::new(crate::cgi::CgiHandler::new(Arc::new(config_guard.clone()), state.clone()))
+        };
 
         Ok(Self {
             config,
             state,
             listeners: Vec::new(),
+            cgi_handler,
         })
     }
 
@@ -85,8 +95,10 @@ impl ProxyServer {
             let state = self.state.clone();
             let config = self.config.clone();
 
+            let cgi_handler = self.cgi_handler.clone();
+
             let handle = tokio::spawn(async move {
-                Self::accept_loop(listener, state, config).await;
+                Self::accept_loop(listener, state, config, cgi_handler).await;
             });
 
             handles.push(handle);
@@ -102,7 +114,7 @@ impl ProxyServer {
         Ok(())
     }
 
-    async fn accept_loop(listener: TcpListener, state: Arc<AppState>, config: ConfigRef) {
+    async fn accept_loop(listener: TcpListener, state: Arc<AppState>, config: ConfigRef, cgi_handler: Arc<crate::cgi::CgiHandler>) {
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
@@ -152,9 +164,10 @@ impl ProxyServer {
                     // Spawn a task to handle the connection
                     let state_clone = state.clone();
                     let config_clone = config.clone();
+                    let cgi_handler_clone = cgi_handler.clone();
 
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_connection(stream, addr, state_clone, config_clone).await {
+                        if let Err(e) = Self::handle_connection(stream, addr, state_clone, config_clone, cgi_handler_clone).await {
                             debug!("Connection error from {}: {}", addr, e);
                         }
                     });
@@ -172,6 +185,7 @@ impl ProxyServer {
         addr: SocketAddr,
         state: Arc<AppState>,
         config: ConfigRef,
+        cgi_handler: Arc<crate::cgi::CgiHandler>,
     ) -> PrivoxyResult<()> {
         let client = state.client_manager.create_client(addr).await;
         let client_id = {
@@ -182,8 +196,7 @@ impl ProxyServer {
         state.statistics.increment_requests_received();
 
         debug!("Client {} connected from {}", client_id, addr);
-
-        let mut handler = ConnectionHandler::new(stream, addr, config);
+        let mut handler = ConnectionHandler::new(stream, addr, config, cgi_handler);
 
         let mut client_guard = client.write().await;
         let result = handler.handle(&mut client_guard).await;

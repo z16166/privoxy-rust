@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -37,10 +38,11 @@ pub struct ConnectionHandler {
     server_stream: Option<TcpStream>,
     buffer: BytesMut,
     config: ConfigRef,
+    cgi_handler: Arc<crate::cgi::CgiHandler>,
 }
 
 impl ConnectionHandler {
-    pub fn new(client_stream: TcpStream, client_addr: SocketAddr, config: ConfigRef) -> Self {
+    pub fn new(client_stream: TcpStream, client_addr: SocketAddr, config: ConfigRef, cgi_handler: Arc<crate::cgi::CgiHandler>) -> Self {
         let buffer_size = config.read().receive_buffer_size;
         Self {
             client_stream,
@@ -48,19 +50,32 @@ impl ConnectionHandler {
             server_stream: None,
             buffer: BytesMut::with_capacity(buffer_size),
             config,
+            cgi_handler,
         }
     }
 
     pub async fn handle(&mut self, client_state: &mut ClientState) -> PrivoxyResult<()> {
         debug!("Handling connection from {}", self.client_addr);
 
-        let request = match self.read_request().await? {
+        let mut request = match self.read_request().await? {
             Some(req) => req,
             None => {
                 debug!("No request received from client");
                 return Ok(());
             }
         };
+
+        // Align with C implementation: CGI dispatch shares the proxy port
+        #[cfg(feature = "cgi")]
+        {
+            if self.cgi_handler.is_cgi_request(&request) {
+                debug!("Intercepting CGI request for {}", request.host);
+                let response = self.cgi_handler.handle_cgi_request(request).await;
+                self.client_stream.write_all(&response.to_bytes()).await
+                    .map_err(|e| PrivoxyError::Io(e))?;
+                return Ok(());
+            }
+        }
 
         trace!("Received request: {}", request.cmd);
         client_state.set_request(request.clone());

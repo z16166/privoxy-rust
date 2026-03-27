@@ -13,9 +13,7 @@ use crate::error::PrivoxyResult;
 /// Global flag to track if logging has been initialized
 static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-#[cfg(feature = "tray-icon")]
 use once_cell::sync::Lazy;
-#[cfg(feature = "tray-icon")]
 use parking_lot::RwLock;
 
 /// Global registry for the GUI log cache to allow late-binding
@@ -61,6 +59,14 @@ impl GuiLogLayer {
         }
     }
 }
+
+/// Global flag to track if a UI update is already pending to prevent flooding
+#[cfg(feature = "tray-icon")]
+static UI_UPDATE_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Global flag to track if the log window is currently visible
+#[cfg(feature = "tray-icon")]
+pub static LOG_WINDOW_VISIBLE: AtomicBool = AtomicBool::new(false);
 
 impl<S> Layer<S> for GuiLogLayer
 where
@@ -112,21 +118,37 @@ where
                         cache.0.drain(0..drain_count);
                     }
                     
-                    // Real-time UI update if handles are matched
+                    // Real-time UI update if handles are matched and no update is pending
                     if let Some(ui_handles) = cache.1.as_ref() {
-                        let event_queue = ui_handles.event_queue.clone();
-                        let textarea_ptr = ui_handles.log_textarea.as_ref().map(|t| t.ptr() as usize);
-                        let message_clone = formatted_message.clone();
-                        
-                        event_queue.queue_main(move || {
-                            if let Some(ptr) = textarea_ptr {
-                                unsafe {
-                                    let mut textarea = libui::controls::MultilineEntry::from_raw(ptr as *mut _);
-                                    textarea.append(&message_clone);
-                                    textarea.append("\n");
+                        // Only proceed if window is visible and no update is pending
+                        // (Use manual flag since libui doesn't have a reliable visible() method)
+                        if LOG_WINDOW_VISIBLE.load(Ordering::SeqCst) && !UI_UPDATE_PENDING.load(Ordering::SeqCst) {
+                            UI_UPDATE_PENDING.store(true, Ordering::SeqCst);
+                            
+                            let event_queue = ui_handles.event_queue.clone();
+                            let textarea_ptr = ui_handles.log_textarea.as_ref().map(|t| t.ptr() as usize);
+                            let log_cache_ui = log_cache.clone();
+                            
+                            event_queue.queue_main(move || {
+                                if let Some(ptr) = textarea_ptr {
+                                    if let Ok(mut cache) = log_cache_ui.lock() {
+                                        // Update the textarea with ALL messages currently in the cache
+                                        // (In a more optimized version, we'd only append NEW messages, 
+                                        // but for simplicity we'll just append what's there and then clear the pending flag)
+                                        unsafe {
+                                            let mut textarea = libui::controls::MultilineEntry::from_raw(ptr as *mut _);
+                                            // To keep it simple and responsive, we just append the latest message
+                                            // the logic here ensures we don't call this 1000 times/sec
+                                            if let Some(last) = cache.0.last() {
+                                                textarea.append(last);
+                                                textarea.append("\n");
+                                            }
+                                        }
+                                    }
                                 }
-                            }
-                        });
+                                UI_UPDATE_PENDING.store(false, Ordering::SeqCst);
+                            });
+                        }
                     }
                 }
                 #[cfg(not(feature = "tray-icon"))]

@@ -45,6 +45,8 @@ mod windows_service;
 mod tray_icon;
 
 use crate::config::{Config, ConfigRef};
+#[cfg(not(feature = "tray-icon"))]
+use crate::logger::init_logging;
 
 use crate::server::ProxyServer;
 
@@ -188,27 +190,8 @@ async fn main() -> Result<()> {
     // Get application state from server
     let state = server.get_state();
 
-    // Start CGI web interface if enabled
-    #[cfg(feature = "cgi")]
-    let _cgi_handle = if cli.enable_cgi {
-        use crate::cgi::CgiHandler;
-        
-        let config_for_cgi = {
-            let config_guard = config.read();
-            Arc::new(config_guard.clone())
-        };
-        let cgi_handler = Arc::new(CgiHandler::new(config_for_cgi, state.clone()));
-        
-        let cgi_handle = tokio::spawn(async move {
-            if let Err(e) = cgi_handler.start_web_interface("127.0.0.1:8119").await {
-                error!("CGI server error: {}", e);
-            }
-        });
-        
-        Some(cgi_handle)
-    } else {
-        None
-    };
+    // CGI processing is now integrated into the ProxyServer's request handling loop.
+    // Requests for config.privoxy.org or p.p will be intercepted and handled by CgiHandler.
 
     // Setup graceful shutdown with config for SIGHUP handling
     let shutdown_signal = setup_shutdown_handler(config.clone());
